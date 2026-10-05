@@ -42,8 +42,8 @@ from n3fit.layers import (
     Mask,
     ObsRotation,
     Preprocessing,
-    losses,
 )
+from n3fit.layers.output import NamedOutput
 from n3fit.layers.observable import is_unique
 from n3fit.msr import generate_msr_model_and_grid
 from validphys.photon.compute import Photon
@@ -53,9 +53,14 @@ from n3fit.backends import regularizer_selector  # isort: skip isort and black d
 
 @dataclass
 class ObservableWrapper:
-    """Wraps many observables into an experimental layer once the PDF model is prepared
+    """Wraps many observables into an experimental layer once the PDF model is prepared.
     It can take normal datasets or Lagrange-multiplier-like datasets
-    (such as positivity or integrability)
+    (such as positivity or integrability).
+
+    Calling it on a PDF tensor returns the ``(prediction, term)`` pair of that dataset in that
+    role: before P4 it returned the *loss*, which is why one dataset needed one wrapper per role
+    only when the roles disagreed about the data -- now every role has its own terms by name, and
+    the positivity/integrability branch below builds the validation wrapper explicitly.
     """
 
     # IDEALLY:
@@ -76,20 +81,49 @@ class ObservableWrapper:
     data: np.array = None
     rotation: ObsRotation = None  # only used for diagonal covmat
 
-    def _generate_loss(self, mask=None):
-        """Generates the corresponding loss function depending on the values the wrapper
-        was initialized with"""
+    def _build_objective(self, mask=None):
+        """The objective term of this observable group, built by the backend from a spec (P3).
+
+        What moved: this method used to know *which layer class* implements chi2, positivity or
+        integrability and how to call its constructor.  Now it says *which kind of term* it is and
+        what data it has; ``Backend.objective`` resolves the kind against the backend's declared
+        schema and constructs it.  A second backend implements the same three kinds with its own
+        machinery and this file does not change.
+
+        P4 moved the *term* out of the graph: what comes back here is a contract ``Objective``
+        that the engine applies (to the prediction, in the compiled loss and in the evaluated
+        groups), instead of a layer that becomes the model's output.
+        """
+        from n3fit.backends import get_backend
+        from n3fit.backends.base import ObjectiveSpec
+
         if self.invcovmat is not None:
-            covmat_matrix = self.covmat
-            invcovmat_matrix = self.invcovmat
-            loss = losses.LossInvcovmat(
-                invcovmat_matrix, self.data, mask, covmat=covmat_matrix, name=self.name
+            spec = ObjectiveSpec(
+                kind="chi2",
+                name=self.name,
+                data={"invcovmat": self.invcovmat, "covmat": self.covmat, "target": self.data},
+                mask=mask,
             )
         elif self.positivity:
-            loss = losses.LossPositivity(name=self.name, c=self.multiplier)
+            spec = ObjectiveSpec(
+                kind="positivity",
+                name=self.name,
+                options={"multiplier": self.multiplier},
+            )
         elif self.integrability:
-            loss = losses.LossIntegrability(name=self.name, c=self.multiplier)
-        return loss
+            spec = ObjectiveSpec(
+                kind="integrability",
+                name=self.name,
+                options={"multiplier": self.multiplier},
+            )
+        else:  # pragma: no cover - the wrapper is always built with one of the three
+            raise ValueError(
+                f"ObservableWrapper {self.name!r} has neither data nor a penalty flag: "
+                f"there is no objective to build"
+            )
+        # The term itself, not a tensor: from P4 on the model is a *prediction* and the engine
+        # applies the terms (contract §1.15).  n3fit never sees the loss *layer*.
+        return get_backend().objective(spec)
 
     def _generate_experimental_layer(self, pdf):
         """Generate the experimental layer by feeding to each observable its PDF.
@@ -118,9 +152,16 @@ class ObservableWrapper:
         return ret
 
     def __call__(self, pdf_layer, mask=None):
-        loss_f = self._generate_loss(mask)
+        """Build this observable's contribution to a role graph: ``(prediction, term)``.
+
+        The prediction is the graph output (masked, rotated, named after the term -- see
+        :class:`n3fit.layers.output.NamedOutput`), and the term is the objective over it.  Keeping
+        them together is what lets ``ModelTrainer`` hand the engine a flat ``{name: term}`` mapping
+        while assembling the three role graphs from the very same calls.
+        """
         experiment_prediction = self._generate_experimental_layer(pdf_layer)
-        return loss_f(experiment_prediction)
+        prediction = NamedOutput(name=self.name)(experiment_prediction)
+        return prediction, self._build_objective(mask)
 
 
 def observable_generator(
@@ -157,10 +198,10 @@ def observable_generator(
     The output is a dictionary (`layer_info`), each one of the three output functions
     have a signature:
 
-        `def out_tr(pdf_layer, dataset_out=None)`
+        `def out_tr(pdf_layer, mask=None)`
 
+    which returns the ``(prediction, term)`` pair for that role (P4; before, it returned the loss).
     The `pdf_layer` must be a layer of shape (1, size_of_xgrid, flavours)
-    `datasets_out` is the list of dataset to be masked to 0 when generating the layer
 
     Parameters
     ----------
@@ -189,7 +230,13 @@ def observable_generator(
             - `inputs`: input layer
             - `output`: output layer (unmasked)
             - `output_tr`: output layer (training)
-            - `output_vl`: output layer (validation)
+            - `output_vl`: output layer (validation); for a positivity dataset the penalty is part
+              of the validation objective too (P4), so it is given there as well -- an
+              integrability dataset only has the training one
+            - `objective_tr`, `objective_vl`, `objective_exp`: the *names* of the objective terms
+              (P3).  The trainer builds its ``ObjectiveGroup`` from these instead of re-deriving
+              them from the spec name and the generator's own naming convention: whoever names a
+              term knows its name, and this is the only place that does.
             - `experiment_xsize`: int (size of the output array)
     """
     spec_name = spec_dict["name"]
@@ -270,6 +317,12 @@ def observable_generator(
         obsrot = None
 
     if spec_dict["positivity"]:
+        # A penalty is used by more than one role (positivity is in training *and* validation)
+        # and, from P4 on, a term is identified by its name in one flat mapping, so each role gets
+        # its own wrapper -- hence its own term, its own output name and its own multiplier,
+        # which is what the graphs had anyway (the loss layer was built per call).  The mask and
+        # the data are the training ones in both roles, as they always were: the validation
+        # penalty measures the same points.
         out_positivity = ObservableWrapper(
             spec_name,
             model_observables,
@@ -283,8 +336,21 @@ def observable_generator(
         layer_info = {
             "inputs": model_inputs,
             "output_tr": out_positivity,
+            "objective_tr": out_positivity.name,
             "experiment_xsize": sum(dataset_xsizes),
         }
+        if not integrability:
+            # Integrability is training-only, so it has no validation counterpart to build.
+            out_positivity_val = ObservableWrapper(
+                f"{spec_name}_val",
+                model_observables,
+                tr_mask_layer,
+                dataset_xsizes,
+                multiplier=positivity_initial,
+                positivity=True,
+            )
+            layer_info["output_vl"] = out_positivity_val
+            layer_info["objective_vl"] = out_positivity_val.name
         # For positivity we end here
         return layer_info
 
@@ -325,6 +391,9 @@ def observable_generator(
         "output": out_exp,
         "output_tr": out_tr,
         "output_vl": out_vl,
+        "objective_tr": out_tr.name,
+        "objective_vl": out_vl.name,
+        "objective_exp": out_exp.name,
         "experiment_xsize": sum(dataset_xsizes),
     }
     return layer_info

@@ -36,6 +36,7 @@ from typing import Callable
 
 import numpy as np
 
+from n3fit.backends import get_backend
 from n3fit.vpinterface import N3PDF, HyperoptMetrics, compute_hyperopt_metrics
 from validphys.core import DataGroupSpec
 from validphys.pdfgrids import distance_grids, xplotting_grid
@@ -108,7 +109,8 @@ IMPLEMENTED_LOSSES = ["chi2", "phi2", "logp", "chi2p"]
 
 def _pdfs_to_n3pdfs(pdfs_per_fold):
     """Convert a list of multi-replica PDFs to a list of N3PDFs"""
-    return [N3PDF(pdf.split_replicas(), name=f"fold_{k}") for k, pdf in enumerate(pdfs_per_fold)]
+    ensemble = get_backend().ensemble
+    return [N3PDF(ensemble(pdf), name=f"fold_{k}") for k, pdf in enumerate(pdfs_per_fold)]
 
 
 class HyperLoss:
@@ -217,7 +219,7 @@ class HyperLoss:
         >>> fake_fl = [{'fl' : i, 'largex' : [0,1], 'smallx': [1,2]} for i in ['u', 'ubar', 'd', 'dbar', 'c', 'g', 's', 'sbar']]
         >>> settings = [ReplicaSettings(nodes=[8], activations=['linear'], seed=seed) for seed in [0, 2]]
         >>> pdf_model = generate_pdf_model(settings, flav_info=fake_fl, fitbasis="FLAVOUR")
-        >>> pdf = N3PDF(pdf_model.split_replicas())
+        >>> pdf = N3PDF(get_backend().ensemble(pdf_model))
         >>> with redirect_stdout(io.StringIO()):
         ...     loss = hyper.compute_loss(penalties, validation_loss=experimental_loss, experimental_loss=experimental_loss, pdf_object=pdf, experimental_data=experimental_data)
         """
@@ -430,93 +432,46 @@ def fit_distance(pdfs_per_fold=None, **_kwargs):
 
 
 def _set_central_value(n3pdf, model):
-    """Given an N3PDF object and a MetaModel, set the PDF_0 layer
-    to be the central value of the n3pdf object"""
-    from n3fit.backends import operations as op
+    """Given an N3PDF object and a MetaModel, set the reference PDF
+    to be the central value of the n3pdf object
 
-    # Get the input x
-    for key, grid in model.x_in.items():
-        if key != "xgrid_integration":
-            input_x = grid.numpy()
-            break
+    The reference section is the PDF model itself (the nested layer the generators name
+    ``PDFs`` -- it was ``PDF_0`` until commit b919773ef, 2023-10-23, renamed everywhere except
+    here).  It is addressed by *role* (``"reference"``), and the function handed to ``override``
+    is plain numpy: the adapter owns the conversion to whatever the backend wants, which is why
+    this no longer needs the backend's operations.
+
+    Like the code it replaces, this is **destructive** -- the PDF section is shared by the
+    training, validation and experimental models, so all three see the constant afterwards, and
+    ``freeze()`` means they stay that way.
+    """
+    from n3fit.backends import ROLE_REFERENCE
+
+    view = get_backend().view(model)
+
+    # Get the input x (the grid the model carries in the graph rather than in the data).  The
+    # integration grid is in ``bound_inputs`` too and is *not* the fit's grid, so it is the one
+    # input that is never picked.  A model with no grid at all is an error, not a silent
+    # ``UnboundLocalError`` two lines later (what this said before P3 recorded the contract).
+    bound = view.bound_inputs()
+    input_x = bound.get("pdf_input")
+    if input_x is None:
+        input_x = next(
+            (grid for key, grid in bound.items() if key != "xgrid_integration"), None
+        )
+    if input_x is None:
+        raise ValueError(
+            "this model carries no x grid among its bound inputs, so the central value of the "
+            f"PDF cannot be computed; it has {sorted(bound)}"
+        )
 
     # Compute the central value of the PDF
     full_pdf = n3pdf(input_x)
-    cv_pdf = op.numpy_to_tensor(np.mean(full_pdf, axis=0, keepdims=True))
+    cv_pdf = np.mean(full_pdf, axis=0, keepdims=True)
 
-    def central_value(x, training=None):  # pylint: disable=unused-argument
+    def central_value(inputs):  # pylint: disable=unused-argument
         return cv_pdf
 
-    model.get_layer("PDF_0").call = central_value
+    view.override(ROLE_REFERENCE, central_value)
     # This model won't be trainable ever again
-    model.trainable = False
-    model.compile()
-
-
-def fit_future_tests(n3pdfs=None, experimental_models=None, **_kwargs):
-    """Use the future tests as a metric for hyperopt
-
-    NOTE: this function should only be called once at the end of
-    every hyperopt iteration, as it is destructive for the models
-    """
-    if n3pdfs is None:
-        raise ValueError("fit_future_test needs n3pdf models to act upon")
-    if experimental_models is None:
-        raise ValueError("fit_future_test needs experimental_models to compute chi2")
-
-    from n3fit.backends import MetaModel
-
-    compatibility_mode = False
-    try:
-        import tensorflow as tf
-
-        from n3fit.backends import set_eager
-
-        tf_version = tf.__version__.split(".")
-        if int(tf_version[0]) == 2 and int(tf_version[1]) < 4:
-            set_eager(True)
-            compatibility_mode = True
-    except ImportError:
-        pass
-
-    # For the last model the PDF covmat doesn't need to be computed.
-    # This is because the last model corresponds to an empty k-fold partition,
-    # meaning that all datasets were used during training.
-    # but the mask needs to be flipped in the folding for the appropiate datasets
-    last_model = experimental_models[-1]
-    _set_central_value(n3pdfs[-1], last_model)
-
-    # Loop over all models but the last (our reference!)
-    total_loss = 0.0
-    for n3pdf, exp_model in zip(n3pdfs[:-1], experimental_models[:-1]):
-        _set_central_value(n3pdf, exp_model)
-
-        # Get the full input and the total chi2
-        full_input = exp_model.input
-
-        # Now update the loss with the PDF covmat
-        for layer in exp_model.get_layer_re(".*_exp$"):
-            # Get the input to the loss layer
-            model_output = MetaModel(full_input, layer.input)
-            # Get the full predictions and generate the PDF covmat
-            y = model_output.predict()[0]  # The first is a dummy-dim
-            pdf_covmat = np.cov(y, rowvar=False)
-            # Update the covmat of the loss
-            layer.add_covmat(pdf_covmat)
-            # Update the mask of the last_model so that its synced with this layer
-            last_model.get_layer(layer.name).update_mask(layer.mask)
-
-        # Compute the loss with pdf errors
-        pdf_chi2 = exp_model.compute_losses()["loss"][0]
-
-        # And the loss of the best (most complete) fit
-        best_chi2 = last_model.compute_losses()["loss"][0]
-
-        # Now make this into a measure of the total loss
-        # for instance, any deviation from the "best" value is bad
-        total_loss += np.abs(best_chi2 - pdf_chi2)
-
-    if compatibility_mode:
-        set_eager(False)
-
-    return total_loss
+    view.freeze()

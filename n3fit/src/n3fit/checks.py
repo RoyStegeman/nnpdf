@@ -6,6 +6,7 @@ import logging
 import numbers
 import os
 
+from n3fit.backends import get_backend
 from n3fit.hyper_optimization import penalties as penalties_module
 from n3fit.hyper_optimization.rewards import IMPLEMENTED_LOSSES, IMPLEMENTED_STATS
 from reportengine.checks import CheckError, make_argcheck
@@ -102,6 +103,15 @@ def check_stopping(parameters):
     pdelta = parameters.get("stopping_delta", 1.0)
     if pdelta < 0:
         raise CheckError(f"Needs stopping_delta={pdelta} to be positive")
+    # ``monitor_every`` is how often the fit looks at the validation loss (P4/D6); the default, 1,
+    # is what the legacy loop did.  It has to be a positive integer: the stopping patience is
+    # converted from steps to monitored steps, and a zero or a fraction would divide by it.
+    monitor_every = parameters.get("monitor_every", 1)
+    if not isinstance(monitor_every, int) or isinstance(monitor_every, bool) or monitor_every < 1:
+        raise CheckError(
+            f"Needs monitor_every={monitor_every} to be a positive integer (it is the number of "
+            f"optimizer steps between two checks of the validation loss)"
+        )
 
 
 def check_basis_with_layers(basis, validphys_basis, parameters, trial_specs):
@@ -137,14 +147,14 @@ def check_optimizer(optimizer_dict):
     """Checks whether the optimizer setup is valid"""
     name_key = "optimizer_name"
     name = optimizer_dict[name_key]
-    from n3fit.backends import MetaModel
+    backend = get_backend()
 
-    accepted_optimizers = MetaModel.accepted_optimizers
+    accepted_optimizers = backend.capabilities.optimizers
     optimizer_data = accepted_optimizers.get(name)
     if optimizer_data is None:
-        raise CheckError(f"Optimizer {name} not accepted by MetaModel")
+        raise CheckError(f"Optimizer {name} not accepted by the {backend.name} backend")
     # Get the dictionary of accepted parameters
-    data = optimizer_data[1]
+    data = optimizer_data["options"]
     for key in optimizer_dict.keys():
         if key not in data and key != name_key:
             raise CheckError(f"Optimizer {name} does not accept the option: {key}")
@@ -152,15 +162,20 @@ def check_optimizer(optimizer_dict):
 
 def check_initializer(initializer):
     """Checks whether the initializer is implemented"""
-    from n3fit.backends import MetaLayer
+    backend = get_backend()
 
-    accepted_init = MetaLayer.initializers
+    accepted_init = backend.capabilities.initializers
     if initializer not in accepted_init:
-        raise CheckError(f"Initializer {initializer} not accepted by {MetaLayer}")
+        raise CheckError(f"Initializer {initializer} not accepted by the {backend.name} backend")
 
 
 def check_layer_type_implemented(parameters):
-    """Checks whether the layer_type is implemented"""
+    """Checks whether the layer_type is implemented
+
+    NOTE: the list is deliberately shorter than ``capabilities.parametrizations``: the
+    backend offers the LSTM architecture, but the runcard interface does not expose it yet,
+    so this stays a product decision until the P3 specs make it a declared one.
+    """
     layer_type = parameters.get("layer_type")
     implemented_types = ["dense", "dense_per_flavour"]
     if layer_type not in implemented_types:
@@ -186,13 +201,15 @@ def check_dropout(parameters):
 def check_tensorboard(tensorboard):
     """Check that the tensorbard callback can be enabled correctly"""
     if tensorboard is not None:
-        # Check that Tensorflow is installed
-        try:
-            import tensorflow
-        except ModuleNotFoundError as e:
+        # Whether tensorboard can be driven is a backend capability (for Keras it means
+        # running on its tensorflow backend), not something n3fit should find out by
+        # importing tensorflow itself.
+        backend = get_backend()
+        if not backend.capabilities.supports_tensorboard:
             raise ModuleNotFoundError(
-                "The tensorboard callback requires `tensorflow` to be installed"
-            ) from e
+                f"The tensorboard callback requires a backend with tensorboard support; "
+                f"the {backend.name!r} backend has none"
+            )
 
         weight_freq = tensorboard.get("weight_freq", 0)
         if weight_freq < 0:
@@ -227,6 +244,12 @@ def check_model_file(save, load):
     if load:
         if not isinstance(load, str):
             raise CheckError(f"Model file to load: {load} not understood, str expected")
+        if str(load).endswith(".h5"):
+            raise CheckError(
+                f"Model file to load: {load} is a legacy Keras h5 weights file, which the "
+                "current framework can no longer read (it would be silently ignored). Weights "
+                "files are now '.weights.npz'; re-save them from the fit that produced them."
+            )
         if not os.path.isfile(load):
             raise CheckError(f"Model file to load: {load} can not be opened, does it exist?")
         if not os.access(load, os.R_OK):
@@ -368,14 +391,8 @@ def check_kfold_options(kfold):
                 "ensure it is implemented in the HyperLoss class in hyper_optimization/rewards.py"
             )
 
-    partitions = kfold["partitions"]
-    # Check specific errors for specific targets
-    loss_target = kfold.get("fold_statistic")  # TODO: haven't updated this
-    if loss_target == "fit_future_tests":
-        if len(partitions) == 1:
-            raise CheckError("Cannot use target 'fit_future_tests' with just one partition")
-        if partitions[-1]["datasets"]:
-            log.warning("Last partition in future test is not empty, some datasets will be ignored")
+
+
 
 
 def check_correct_partitions(kfold, data):

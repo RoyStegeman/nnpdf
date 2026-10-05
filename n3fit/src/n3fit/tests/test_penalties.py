@@ -21,8 +21,11 @@ def test_saturation():
 
 def test_patience():
     """Check that the patience penalty runs and returns a float"""
+    # The attributes are the read side of ``n3fit.stopping.FitRecord`` (P4): the same four the
+    # legacy ``Stopping`` object exposed, with the budget renamed ``total_steps`` -- the engine
+    # counts optimizer steps, and ``run`` is handed ``steps``.
     fake_stopping = SimpleNamespace(
-        e_best_chi2=1000, stopping_patience=500, total_epochs=5000, vl_chi2=2.42
+        e_best_chi2=1000, stopping_patience=500, total_steps=5000, vl_chi2=2.42
     )
     res = patience(stopping_object=fake_stopping, alpha=1e-4)
     assert isinstance(res, float)

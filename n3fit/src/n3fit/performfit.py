@@ -133,10 +133,17 @@ def performfit(
         parallel_models: bool
             whether to run models in parallel
     """
-    from n3fit.backends import set_initial_state
+    from n3fit.backends import get_backend
 
-    # If debug is active, the initial state will be fixed so that the run is reproducible
-    set_initial_state(debug=debug, max_cores=maxcores, double_precision=double_precision)
+    # If debug is active, the initial state will be fixed so that the run is reproducible.
+    # This goes through the backend state object so that a different backend can define what
+    # "configure the run" means for it (see n3fit.backends.base.BackendState).
+    backend = get_backend()
+    backend.state.configure(
+        deterministic=debug,
+        max_cores=maxcores,
+        dtype="float64" if double_precision else "float32",
+    )
 
     from n3fit.stopwatch import StopWatch
 
@@ -261,9 +268,12 @@ def performfit(
         log.info("Stopped at epoch=%d", stopping_object.stop_epoch)
 
         final_time = stopwatch.stop()
-        all_chi2s = the_model_trainer.evaluate(stopping_object)
+        # The fit's own chi2s, one forward pass per group: the trainer owns the terms and the
+        # optimizer that evaluates them (P4), so it no longer needs the stopping object to say
+        # which part of the training loss was chi2.
+        all_chi2s = the_model_trainer.evaluate()
 
-        pdf_models = result["pdf_model"].split_replicas()
+        pdf_models = backend.ensemble(result["pdf_model"])
         q0 = theoryid.get_description().get("Q0")
         pdf_instances = [N3PDF(pdf_model, fit_basis=basis, Q=q0) for pdf_model in pdf_models]
         writer_wrapper = WriterWrapper(

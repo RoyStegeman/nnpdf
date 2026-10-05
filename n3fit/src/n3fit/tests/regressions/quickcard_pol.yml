@@ -32,7 +32,7 @@ trvlseed: 3
 nnseed: 2
 mcseed: 1
 
-load: "weights_pol.weights.h5"
+load: "weights_pol.weights.npz"
 
 parameters:
   nodes_per_layer: [25, 20, 4]

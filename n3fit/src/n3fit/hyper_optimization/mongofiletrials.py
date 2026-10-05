@@ -33,7 +33,7 @@ except ModuleNotFoundError:
 
     ObjectId = object()
 
-from n3fit.backends import get_physical_gpus
+from n3fit.backends import get_backend
 from n3fit.hyper_optimization.filetrials import space_eval_trial
 
 log = logging.getLogger(__name__)
@@ -272,8 +272,7 @@ class MongoFileTrials(MongoTrials):
     ):
         """Initiates all mongo workers simultaneously."""
         # get the number of gpu cards, if any
-        gpus_all_physical_list = get_physical_gpus()
-        num_gpus_available = len(gpus_all_physical_list)
+        num_gpus_available = len(get_backend().state.devices())
         if not num_gpus_available:
             log.warning("No GPUs found in the system.")
 

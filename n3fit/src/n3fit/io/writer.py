@@ -6,12 +6,14 @@ so previously active scripts can still work.
 """
 
 import json
+from pathlib import Path
 import logging
 
 import numpy as np
 
 import n3fit
 from n3fit import vpinterface
+from n3fit.backends import get_backend
 import validphys
 from validphys.utils import yaml_safe
 
@@ -234,7 +236,9 @@ class WriterWrapper:
             `pdf_objects`
                 function to evaluate with a grid in x to generate a pdf
             `stopping_object`
-                a stopping.Stopping object
+                a ``n3fit.stopping.FitRecord``: the record of the fit, carrying the same names
+                (``chi2exps_json()``, ``e_best_chi2``, ``positivity_statuses``, ``stop_epoch``)
+                the connection to the stopping object was about (P4)
             `all_chi2s`
                 list of all the chi2s, in the order: tr_chi2, vl_chi2, true_chi2
             `theory`
@@ -347,10 +351,22 @@ class WriterWrapper:
         storefit(self.pdf_objects[i], self.replica_numbers[i], out_path, self.theory)
 
     def _write_weights(self, i, out_path):
+        """Save the weights of replica ``i`` in the ``n3fit-weights/2`` schema (P5).
+
+        One replica per file, npz, keyed by the weight store's paths with a manifest inside.
+        Runcards written for the legacy format give ``.h5`` names; those are kept but end in
+        ``.npz`` now (the h5 schema is retired, D8), and a name with no recognized suffix gets
+        ``.weights.npz`` appended, which is what the bare names of older fits used to produce.
+        """
+        out_path = Path(out_path)
+        if out_path.name.endswith(".h5"):
+            out_path = out_path.with_name(out_path.name[: -len(".h5")] + ".npz")
+        elif not out_path.name.endswith(".npz"):
+            out_path = out_path.with_name(out_path.name + ".weights.npz")
         log.info(" > Saving the weights for future in %s", out_path)
         # Extract model out of N3PDF
         model = self.pdf_objects[i]._models[0]
-        model.save_weights(out_path)
+        get_backend().save(model, out_path)
 
 
 class SuperEncoder(json.JSONEncoder):
@@ -426,21 +442,10 @@ def version():
     versions = {}
 
     try:
-        import keras
-
-        backend = keras.backend.backend()
-
-        versions["keras"] = f"{keras.__version__} {backend=}"
-
-        if backend == "tensorflow":
-            import tensorflow as tf
-
-            versions["tensorflow"] = tf.__version__
-        elif backend == "torch":
-            import torch
-
-            versions["torch"] == torch.__version__
-    except:
+        # Which framework (and which of its versions) backs the fit is the backend's
+        # business: see n3fit.backends.base.Backend.version_info
+        versions.update(get_backend().version_info())
+    except Exception:
         # We don't want _any_ uncaught exception to crash the whole program at this point
         pass
 

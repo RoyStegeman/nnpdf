@@ -7,9 +7,9 @@ Penalties in this module usually take as signature the positional arguments:
         model taking a ``(1, xgrid_size, 1)`` array as input
         and returning a ``(1, xgrid_size, 14, replicas)`` pdf.
 
-    stopping_object: :py:class:`n3fit.stopping.Stopping`
-        object holding the information about the validation model
-        and the stopping parameters
+    stopping_object: :py:class:`n3fit.stopping.FitRecord`
+        record of the fit: the validation chi2 it ended on, the stopping parameters and the
+        per-replica best epoch (the legacy ``Stopping`` object's read side, P4)
 
 although not all penalties use both.
 
@@ -21,6 +21,7 @@ The name in the runcard must match the name used in this module.
 
 import numpy as np
 
+from n3fit.backends import get_backend
 from n3fit.vpinterface import N3PDF, integrability_numbers
 from validphys import fitveto
 
@@ -67,7 +68,7 @@ def saturation(pdf_model=None, n=100, min_x=1e-6, max_x=1e-4, flavors=None, **_k
     extra_loss = 0.0
 
     x_input = np.expand_dims(x, axis=[0, -1])
-    y = pdf_model.predict({"pdf_input": x_input})
+    y = get_backend().view(pdf_model)({"pdf_input": x_input})
     xpdf = y[0, :, :, flavors]  # this is now of shape (flavors, replicas, xgrid)
 
     x = np.expand_dims(x, axis=[0, 1])
@@ -106,14 +107,14 @@ def patience(stopping_object, alpha: float = 1e-4, **_kwargs):
     -------
     >>> from n3fit.hyper_optimization.penalties import patience
     >>> from types import SimpleNamespace
-    >>> fake_stopping = SimpleNamespace(e_best_chi2=1000, stopping_patience=500, total_epochs=5000, vl_chi2=2.42)
+    >>> fake_stopping = SimpleNamespace(e_best_chi2=1000, stopping_patience=500, total_steps=5000, vl_chi2=2.42)
     >>> float(patience(fake_stopping, alpha=1e-4))
     3.434143467595683
 
     """
     epoch_best = np.array(stopping_object.e_best_chi2)
     patience = stopping_object.stopping_patience
-    max_epochs = stopping_object.total_epochs
+    max_epochs = stopping_object.total_steps
     diff = abs(max_epochs - patience - epoch_best)
     vl_loss = np.array(stopping_object.vl_chi2)
     return vl_loss * np.exp(alpha * diff)
@@ -146,7 +147,7 @@ def integrability(pdf_model=None, **_kwargs):
     True
 
     """
-    pdf_instance = N3PDF(pdf_model.split_replicas())
+    pdf_instance = N3PDF(get_backend().ensemble(pdf_model))
     integ_values = integrability_numbers(pdf_instance)
 
     # set components under the threshold to 0

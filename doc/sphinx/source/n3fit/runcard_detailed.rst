@@ -409,6 +409,12 @@ With these parameters, the fit will run until the validation loss doesn't improv
 In pratcice the ``stopping_delta`` can be left to the default value of 0.0, it is currently used
 mostly for regression tests in which small differences can change the final results.
 
+``monitor_every`` (default 1) sets how many optimizer steps pass between two checks of the
+validation loss.  Raising it makes a fit cheaper in cases where the extra step is a noticeable part
+of the training step, at the price of a coarser stopping decision; the stopping patience is still
+measured in optimizer steps, so the fit stops at the same point of the trajectory either way.  For
+optimizers that are not iterative (P7) the stopping rule does not apply at all.
+
 
 Save and load weights of the model
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

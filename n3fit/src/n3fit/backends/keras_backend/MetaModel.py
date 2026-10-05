@@ -5,7 +5,7 @@ Extension of the backend Model class containing some wrappers in order to absorb
 backend-dependent calls.
 """
 
-from pathlib import Path
+
 import re
 
 from keras import backend as K
@@ -32,25 +32,9 @@ NN_PREFIX = "NN"
 NN_LAYER_ALL_REPLICAS = "all_NNs"
 PREPROCESSING_LAYER_ALL_REPLICAS = "preprocessing_factor"
 
-#  Running many steps in epoch eliminates some per-epoch overhead and has a big impact
-#  in GPU. In benchmarks, more than 100 steps doesn't seem to have any impact
-#  so this is the rationale for that number.
-#
-#  For reasons that are not clear at the time of writing (13/08/2025) jax only accepts
-#  one step per epoch, showing the same penalty of other libraries.
-STEPS_PER_EPOCH = 100
-if K.backend() == "jax":
-    STEPS_PER_EPOCH = 1
-
 # Some keys need to work for everyone
 for k, v in optimizers.items():
     v[1]["clipnorm"] = 1.0
-
-
-def _default_loss(y_true, y_pred):  # pylint: disable=unused-argument
-    """Default loss to be used when the model is compiled with loss = Null
-    (for instance if the prediction of the model is already the loss"""
-    return ops.nansum(y_pred)
 
 
 class MetaModel(Model):
@@ -111,8 +95,6 @@ class MetaModel(Model):
         self.input_tensors = input_tensors
         self.single_replica_generator = None
 
-        self.target_tensors = None
-        self.compute_losses_function = None
         self._scaler = scaler
 
         # Keras' __setattr__ would try to track the input dictionary as a TrackedDict
@@ -120,7 +102,7 @@ class MetaModel(Model):
         object.__setattr__(self, "x_in", x_in)
 
     def _parse_input(self, extra_input=None):
-        """Returns the input data the model was compiled with.
+        """Returns the input data the model was built with.
         Introduces the extra_input in the places asigned to the placeholders.
 
         If the model was generated with a scaler, the input will be scaled accordingly
@@ -144,162 +126,11 @@ class MetaModel(Model):
 
         return {**self.x_in, **extra_input}
 
-    def perform_fit(self, x=None, y=None, epochs=1, **kwargs):
-        """
-        Performs forward (and backwards) propagation for the model for a given number of epochs.
-
-        The output of this function consists on a dictionary that maps the names of the metrics
-        of the model (the loss functions) to the partial losses.
-
-        If the model was compiled with input and output data, they will not be passed through.
-        In this case by default the number of ``epochs`` will be set to 1
-
-        ex:
-            {'loss': [100], 'dataset_a_loss1' : [67], 'dataset_2_loss': [33]}
-
-        Returns
-        -------
-            loss_dict: dict
-                a dictionary with all partial losses of the model
-        """
-        x_params = self._parse_input(x)
-        if y is None:
-            y = self.target_tensors
-
-        # Running more than 1 step for every epoch eliminates some overhead of the backend libraries.
-        # In the special case in which epochs < STEPS_PER_EPOCH, set it to 1
-        if epochs < STEPS_PER_EPOCH:
-            steps_per_epoch = 1
-        else:
-            steps_per_epoch = STEPS_PER_EPOCH
-
-        for k, v in x_params.items():
-            x_params[k] = ops.repeat(v, steps_per_epoch, axis=0)
-        y = [ops.repeat(yi, steps_per_epoch, axis=0) for yi in y]
-        history = super().fit(
-            x=x_params, y=y, epochs=epochs // steps_per_epoch, batch_size=1, **kwargs
-        )
-        loss_dict = history.history
-        return loss_dict
-
     def predict(self, x=None, **kwargs):
         """Call super().predict with the right input arguments"""
         x = self._parse_input(x)
         result = super().predict(x=x, **kwargs)
         return result
-
-    def compute_losses(self):
-        """
-        This function is equivalent to the model ``evaluate(x,y)`` method of most TensorFlow models
-        which return a dictionary of losses per output layer.
-        The losses reported in the ``evaluate`` method for n3fit are, however, summed over replicas.
-        Instead the loss we are interested in is usually the output of the model (i.e., predict)
-        This function then generates a dict of partial losses of the model separated per replica.
-        i.e., the output for experiment {'LHC_exp'} will be an array of Nrep elements.
-
-        Returns
-        -------
-            dict
-                a dictionary with all partial losses of the model
-        """
-        if self.compute_losses_function is None:
-            # If it is the first time we are passing through, compile the function and save it
-            out_names = [f"{i}_loss" for i in self.output_names]
-            out_names.insert(0, "loss")
-
-            inputs = self._parse_input(None)
-            # get rid of the repetitions by number of epochs made in perform_fit
-            for k, v in inputs.items():
-                inputs[k] = v[:1]
-
-            # Compile a evaluation function
-            @ops.decorator_compiler
-            def losses_fun():
-                predictions = self(inputs)
-                # If we only have one dataset the output changes
-                if len(out_names) == 2:
-                    predictions = [predictions]
-                total_loss = ops.nansum(predictions, axis=0)
-                ret = [total_loss] + predictions
-                return dict(zip(out_names, ret))
-
-            self.compute_losses_function = losses_fun
-
-        ret = self.compute_losses_function()
-
-        # The output of this function is to be used by python (and numpy)
-        # so we need to convert the tensors
-        return ops.dict_to_numpy_or_python(ret)
-
-    def compile(
-        self,
-        optimizer_name="RMSprop",
-        learning_rate=None,
-        loss=None,
-        target_output=None,
-        clipnorm=None,
-        **kwargs,
-    ):
-        """
-        Compile the model given an optimizer and a list of loss functions.
-        The optimizer must be one of those implemented in the ``optimizer`` attribute of this class.
-
-        Options:
-            - A learning rate and a list of target outpout can be defined.
-                These will be passed down to the optimizer.
-            - A ``target_output`` can be defined. If done in this way
-                (for instance because we know the target data will be the same for the whole fit)
-                the data will be compiled together with the model and won't be necessary to
-                input it again when calling the ``perform_fit`` or ``compute_losses`` methods.
-
-        Parameters
-        ----------
-            optimizer_name: str
-               string defining the optimizer to be used
-            learning_rate: float
-               learning rate of of the optimizer
-               (if accepted as an argument, if not it will be ignored)
-            loss: list
-               list of loss functions to be pass to the model
-            target_output: list
-                list of outputs to compare the results to during fitting/evaluation
-                if given further calls to fit/evaluate must be done with y = None.
-        """
-        try:
-            opt_tuple = optimizers[optimizer_name]
-        except KeyError as e:
-            raise NotImplementedError(
-                f"[MetaModel.select_initializer] optimizer not implemented: {optimizer_name}"
-            ) from e
-
-        if loss is None:
-            loss = _default_loss
-
-        opt_function = opt_tuple[0]
-        opt_args = opt_tuple[1]
-
-        user_selected_args = {"learning_rate": learning_rate, "clipnorm": clipnorm}
-
-        # Override defaults with user provided values
-        for key, value in user_selected_args.items():
-            if key in opt_args.keys() and value is not None:
-                opt_args[key] = value
-
-        # Instantiate the optimizer
-        opt = opt_function(**opt_args)
-
-        # If given target output is None, target_output is unnecesary, save just a zero per output
-        if target_output is None:
-            self.target_tensors = [ops.numpy_to_tensor(np.zeros((1, 1))) for _ in self.output_shape]
-        else:
-            if not isinstance(target_output, list):
-                target_output = [target_output]
-            self.target_tensors = target_output
-
-        # For debug purposes it may be interesting to set in the compile call
-        # jit_compile = False
-        # run_eager = True
-        super().compile(optimizer=opt, loss=loss)
 
     def set_masks_to(self, names, val=0.0):
         """Set all mask value to the selected value
@@ -395,17 +226,6 @@ class MetaModel(Model):
             layer = self.get_layer(layer_type)
             set_layer_replica_weights(layer=layer, weights=weights[layer_type], i_replica=i_replica)
 
-    def set_replica_weights_from_file(self, model_file, i_replica=0):
-        """
-        Set the weights of replica i_replica from a model file.
-        Wrapper around ``set_replica_weights`` that creates a temporary single-replica-model
-        to get the weights in the appropiate format.
-        """
-        single_replica = self.single_replica_generator(i_replica)
-        single_replica.load_weights(model_file)
-        weights = single_replica.get_replica_weights(0)
-        self.set_replica_weights(weights, i_replica)
-
     def split_replicas(self):
         """
         Split the single multi-replica model into a list of separate single replica models,
@@ -429,39 +249,6 @@ class MetaModel(Model):
     @property
     def num_replicas(self):
         return self.output.shape[1]
-
-    def load_identical_replicas(self, model_file):
-        """
-        From a single replica model, load the same weights into all replicas.
-        """
-        model_file = Path(model_file)
-        single_replica = self.single_replica_generator()
-        single_replica.load_weights(model_file)
-        weights = single_replica.get_replica_weights(0)
-
-        for i_replica in range(self.num_replicas):
-            self.set_replica_weights(weights, i_replica)
-
-    def save_weights(self, file):
-        """
-        Compatibility function for:
-            - tf < 2.16, keras < 3: argument save format needed for h5
-            - tf >= 2.16, keras >= 3: save format is deduced from the file extension
-        In both cases, the final weights are finally copied to the ``file`` path.
-        """
-        try:
-            # Keras 2, tf < 2.16
-            super().save_weights(file, save_format="h5")
-        except TypeError:
-            # Newer versions of keras (>=3) drop the ``save_format`` argument
-            # and instead take the format from the extension of the file
-            # Also, from Keras 3.2 weights files must be suffixed as .weights.h5
-            # for both saving and loading!
-            if file.name.endswith(".weights.h5"):
-                new_file = file
-            else:
-                new_file = file.with_suffix(f".weights.h5")
-            super().save_weights(new_file)
 
 
 def is_stacked_single_replicas(layer):

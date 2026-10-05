@@ -11,20 +11,30 @@ between iterations while at the same time keeping the amount of redundant calls 
 
 from collections import namedtuple
 from itertools import zip_longest
-import json
 import logging
 
 import numpy as np
 
 from n3fit import model_gen
-from n3fit.backends import NN_LAYER_ALL_REPLICAS, MetaModel, callbacks, clear_backend_state
+from n3fit.backends import (
+    GROUP_EXPERIMENTAL,
+    GROUP_INTEGRABILITY,
+    GROUP_POSITIVITY,
+    GROUP_TRAINING,
+    GROUP_VALIDATION,
+    MetaModel,
+    ObjectiveGroup,
+    OptimizerSpec,
+    clear_backend_state,
+    get_backend,
+)
 from n3fit.backends import operations as op
 from n3fit.hyper_optimization.hyper_scan import HYPEROPT_STATUSES
 import n3fit.hyper_optimization.penalties
 from n3fit.hyper_optimization.rewards import HyperLoss
 from n3fit.layers import losses
 from n3fit.scaler import generate_scaler
-from n3fit.stopping import Stopping
+from n3fit.stopping import FitRecord, LagrangeHook, LogHook, StoppingHook, _parse_chi2
 from n3fit.vpinterface import N3PDF, compute_hyperopt_metrics
 from validphys.convolution import central_predictions, predictions
 from validphys.core import DataGroupSpec
@@ -54,10 +64,54 @@ def _pdf_injection(pdf_layers, observables, masks):
     """
     Takes as input a list of PDF layers each corresponding to one observable (also given as a list)
     And (where neded) a mask to select the output.
-    Returns a list of obs(pdf).
+    Returns a list of ``(prediction, term)`` pairs.
+
+    The pairing is the point (P4): one call of an observable wrapper produces *both* the tensor the
+    role graph will output and the objective term over it, so the terms of the three roles cannot
+    drift from the graphs that carry their predictions.
     Note that the list of masks don't need to be the same size as the list of layers/observables
     """
     return [f(x, mask=m) for f, x, m in zip_longest(observables, pdf_layers, masks)]
+
+
+def _parametrization_spec(replicas_settings):
+    """The :class:`ParametrizationSpec` of a fit, from the per-replica settings (P4).
+
+    The kinds and options here are the ones n3fit passes to ``generate_pdf_model``; the name is the
+    architecture (``dense``, ``dense_per_flavour``) and the seeds are the per-replica ones.  It is
+    only used to ask the backend whether the combination is buildable (``check_feasible``), so it
+    carries no state: the graph is still built by ``generate_pdf_model`` until P7 makes the
+    parametrization a backend member.
+    """
+    from n3fit.backends.base import ParametrizationSpec
+
+    first = replicas_settings[0]
+    return ParametrizationSpec(
+        kind=first.architecture,
+        options={
+            "nodes": tuple(first.nodes),
+            "activations": tuple(first.activations),
+            "initializer": first.initializer,
+            "dropout_rate": first.dropout_rate,
+        },
+        seeds=tuple(settings.seed for settings in replicas_settings),
+    )
+
+
+def _ndata_for_terms(term_names, entries, key):
+    """``{term name: ndata array}`` for the chi2 terms of one role, in the order they were built.
+
+    ``entries`` is the reporting list ``_prepare_reporting`` produces; a dataset whose number of
+    points is zero in every replica is left out, exactly as the legacy ``parse_ndata`` did (it
+    dropped those entries, so their loss was not part of the chi2 either).  This is what a k-fold
+    partition relies on.
+    """
+    ndata = {}
+    for name, entry in zip(term_names, entries):
+        points = np.asarray(entry[key])
+        if points.sum() != 0:
+            ndata[name] = points
+    return ndata
 
 
 def _LM_initial_and_multiplier(input_initial, input_multiplier, max_lambda, steps):
@@ -221,11 +275,15 @@ class ModelTrainer:
             "model": None,
             "posdatasets": [],
             "posmultipliers": [],
-            "posinitials": [],
             "integdatasets": [],
             "integmultipliers": [],
-            "integinitials": [],
             "folds": [],
+            # P3: the names of the terms each model carries, in the order they were built --
+            # reported by ``model_gen.observable_generator``, never re-derived here.
+            "chi2_names": [],
+            "penalty_names": [],
+            # term name -> the multiplier the term was built with (what a k-fold reset puts back)
+            "penalty_initials": {},
         }
         self.validation = {
             "output": [],
@@ -234,8 +292,21 @@ class ModelTrainer:
             "model": None,
             "folds": [],
             "posdatasets": [],
+            "chi2_names": [],
+            "penalty_names": [],
         }
-        self.experimental = {"output": [], "expdata": [], "ndata": 0, "model": None, "folds": []}
+        self.experimental = {
+            "output": [],
+            "expdata": [],
+            "ndata": 0,
+            "model": None,
+            "folds": [],
+            "chi2_names": [],
+        }
+        #: Which terms compose each objective group (P3).  Filled by ``_generate_observables``
+        #: from the names the generators returned; consumed by the optimizer (P4), the k-fold
+        #: reset and the reporting.
+        self.objective_groups = None
         self.tr_masks = []
 
         self._fill_the_dictionaries()
@@ -248,9 +319,19 @@ class ModelTrainer:
             # Consider the validation only if there is validation (of course)
             self.no_validation = False
 
-        self.callbacks = []
+        # Hooks that only watch: timing (``debug``) and, if the runcard asked for it, tensorboard.
+        # They are added to the fit's hook list and can neither change the fit nor stop it.
+        self._diagnostic_hooks = []
         if debug:
-            self.callbacks.append(callbacks.TimerCallback())
+            self._diagnostic_hooks.append(LogHook())
+
+        # The fitted model, as the engine sees it: the flat term mapping, the role ensemble and
+        # the optimizer that drove it (P4).  ``evaluate`` and the hyperopt metrics read these
+        # after the fit, one forward pass per group.
+        self.terms = {}
+        self.ensemble = None
+        self.optimizer = None
+        self._chi2_reporting = []
 
     def set_hyperopt(self, hyperopt_on, keys=None):
         """Set hyperopt options on and off (mostly suppresses some printing)"""
@@ -390,6 +471,9 @@ class ModelTrainer:
         as they are never trained, but this is needed by some backends
         in order to run evaluate on them.
 
+        Compiles nothing and carries no loss: the models are *predictions* and the engine applies
+        the terms (P4).
+
         Before entering this function we have the input of the model
         and a list of outputs, but they are not connected.
         This function connects inputs with outputs by injecting the PDF.
@@ -422,7 +506,8 @@ class ModelTrainer:
         Returns
         -------
             models: dict
-                dict of MetaModels for training, validation and experimental
+                dict of MetaModels (prediction graphs, P4) for training, validation and
+                experimental.  The objective terms are collected on ``self.terms``.
         """
         log.info("Generating the Model")
 
@@ -447,9 +532,12 @@ class ModelTrainer:
             experimental_mask = [i[partition_idx] for i in self.experimental["folds"]]
 
         # Training and validation leave out the kofld dataset
-        # experiment leaves out the negation
-        output_tr = _pdf_injection(split_pdf, self.training["output"], training_mask)
-        training = MetaModel(full_model_input_dict, output_tr)
+        # experiment leaves out the negation.
+        #
+        # Each call returns the ``(prediction, term)`` pair of one dataset in one role (P4): the
+        # prediction goes into the graph, the term into the flat mapping the engine is handed.
+        pairs_tr = _pdf_injection(split_pdf, self.training["output"], training_mask)
+        training = MetaModel(full_model_input_dict, [prediction for prediction, _ in pairs_tr])
 
         # Validation skips integrability and the "true" chi2 skips also positivity,
         # so we must only use the corresponding subset of PDF functions
@@ -463,25 +551,63 @@ class ModelTrainer:
                 val_pdfs.append(partial_pdf)
 
         # We don't want to included the integrablity in the validation
-        output_vl = _pdf_injection(val_pdfs, self.validation["output"], validation_mask)
-        validation = MetaModel(full_model_input_dict, output_vl)
+        pairs_vl = _pdf_injection(val_pdfs, self.validation["output"], validation_mask)
+        validation = MetaModel(full_model_input_dict, [prediction for prediction, _ in pairs_vl])
 
         # Or the positivity in the total chi2
-        output_ex = _pdf_injection(exp_pdfs, self.experimental["output"], experimental_mask)
-        experimental = MetaModel(full_model_input_dict, output_ex)
+        pairs_ex = _pdf_injection(exp_pdfs, self.experimental["output"], experimental_mask)
+        experimental = MetaModel(
+            full_model_input_dict, [prediction for prediction, _ in pairs_ex]
+        )
+
+        # One flat ``{term name: Objective}`` mapping over the three roles -- the mapping the
+        # engine is given.  Building it from the pairs (rather than from the graphs) is what makes
+        # A6 enforceable: two roles cannot end up sharing a term object, and a name that is used
+        # twice is caught here instead of silently routing a term to the wrong prediction.
+        self.terms = {}
+        for prediction, term in pairs_tr + pairs_vl + pairs_ex:
+            if term.name in self.terms:
+                raise RuntimeError(
+                    f"the objective term {term.name!r} is used by more than one role: a term is "
+                    f"identified by its name in the engine's flat mapping, so every role needs its "
+                    f"own (e.g. 'POS' and 'POS_val')"
+                )
+            self.terms[term.name] = term
+
+        # P3: each group must name exactly the terms its model carries (and in the same order).
+        # The groups were built from the names the generators returned, so this only fires if the
+        # two ever drift apart -- which is the failure mode that would otherwise surface as a
+        # silently wrong loss in P4, when the names are what pairs an output with its term.
+        for group, graph, pairs in (
+            (GROUP_TRAINING, training, pairs_tr),
+            (GROUP_VALIDATION, validation, pairs_vl),
+            (GROUP_EXPERIMENTAL, experimental, pairs_ex),
+        ):
+            names = list(self.objective_groups.names(group))
+            built = [term.name for _, term in pairs]
+            if names != built:
+                raise RuntimeError(
+                    f"the {group!r} objective group members {names} are not the terms the "
+                    f"{group!r} graph was built from ({built}); the groups and the models are out "
+                    f"of sync"
+                )
+            # ... and a term must be *findable* in its graph, because that is how the engine routes
+            # it to a prediction: by name (``{name: tensor}`` outputs, contract §1.15).  The names
+            # here are the output names -- for a Keras graph, the names of the ``NamedOutput``
+            # layers, which is what ``Model.output_names`` reports.
+            outputs = list(getattr(graph, "output_names", ()))
+            for term in (term for _, term in pairs):
+                wanted = term.spec.prediction or term.name
+                if outputs and wanted not in outputs:
+                    raise RuntimeError(
+                        f"the term {term.name!r} reads the prediction {wanted!r}, which is not an "
+                        f"output of the {group!r} graph ({outputs})"
+                    )
 
         if self.print_summary:
-            training.summary()
-            pdf_model = training.get_layer("PDFs")
-            pdf_model.summary()
-            nn_model = pdf_model.get_layer(NN_LAYER_ALL_REPLICAS)
-            nn_model.summary()
-            # We may have fits without sumrules imposed
-            try:
-                msr_model = pdf_model.get_layer("impose_msr")
-                msr_model.summary()
-            except ValueError:
-                pass
+            # One role-aware summary instead of a chain of get_layer(...).summary() calls: which
+            # sections exist (photon, sum rule, preprocessing) is the backend's business.
+            get_backend().view(training).summary()
 
         models = {"training": training, "validation": validation, "experimental": experimental}
 
@@ -496,10 +622,15 @@ class ModelTrainer:
         or be obliterated when/if the backend state is reset
         """
         self.input_list = []
-        for key in ["output", "posmultipliers", "integmultipliers"]:
+        for key in ["output", "posmultipliers", "integmultipliers", "chi2_names", "penalty_names"]:
             self.training[key] = []
             self.validation[key] = []
             self.experimental[key] = []
+        self.training["penalty_initials"] = {}
+        # The terms (P4): a flat ``{name: Objective}`` mapping over the three roles, filled by
+        # ``_model_generation`` from the very calls that build the graphs.  Reset here for the same
+        # reason as the outputs: they belong to the models of one fold.
+        self.terms = {}
 
     ############################################################################
     # # Parameterizable functions                                                #
@@ -595,6 +726,12 @@ class ModelTrainer:
             self.validation["output"].append(exp_layer["output_vl"])
             self.experimental["output"].append(exp_layer["output"])
 
+            # ... and the names of those terms, so that the objective groups below name the same
+            # terms the models carry, in the same order
+            self.training["chi2_names"].append(exp_layer["objective_tr"])
+            self.validation["chi2_names"].append(exp_layer["objective_vl"])
+            self.experimental["chi2_names"].append(exp_layer["objective_exp"])
+
         # Generate the positivity penalty
         for pos_dict in self.pos_info:
             if not self.mode_hyperopt:
@@ -622,12 +759,21 @@ class ModelTrainer:
             # The input list is still common
             self.input_list.append(pos_layer["inputs"])
 
-            # The positivity should be on both training and validation models
+            # The positivity penalty is part of both the training and the validation objective,
+            # as *two* terms with their own names (P4): the contract identifies a term by its name
+            # and one name cannot live in two roles.  ``POS`` is the one the Lagrange schedule
+            # scales, ``POS_val`` is the one the stopping rule's positivity check reads (the
+            # legacy read the validation model's, which was built with the initial multiplier and
+            # never scaled -- the callback looked the layer up in the training model).
             self.training["output"].append(pos_layer["output_tr"])
-            self.validation["output"].append(pos_layer["output_tr"])
+            self.validation["output"].append(pos_layer["output_vl"])
 
             self.training["posmultipliers"].append(pos_multiplier)
-            self.training["posinitials"].append(pos_initial)
+            # the term names, as the generator named them, and the multiplier they were built with
+            pos_name = pos_layer["objective_tr"]
+            self.training["penalty_names"].append(pos_name)
+            self.validation["penalty_names"].append(pos_layer["objective_vl"])
+            self.training["penalty_initials"][pos_name] = pos_initial
 
         # Finally generate the integrability penalty
         for integ_dict in self.integ_info:
@@ -654,7 +800,25 @@ class ModelTrainer:
             # The integrability all falls to the training
             self.training["output"].append(integ_layer["output_tr"])
             self.training["integmultipliers"].append(integ_multiplier)
-            self.training["integinitials"].append(integ_initial)
+            integ_name = integ_layer["objective_tr"]
+            self.training["penalty_names"].append(integ_name)
+            self.training["penalty_initials"][integ_name] = integ_initial
+
+        # The objective groups (P3).  Membership is decided *here*, by the code that built the
+        # terms, and in the order the models carry them (chi2 first, then the penalties) -- P4
+        # hands these names to the optimizer together with the terms, and the optimizer never
+        # decides which loss is part of which objective.
+        self.objective_groups = ObjectiveGroup(
+            {
+                GROUP_TRAINING: tuple(self.training["chi2_names"])
+                + tuple(self.training["penalty_names"]),
+                GROUP_VALIDATION: tuple(self.validation["chi2_names"])
+                + tuple(self.validation["penalty_names"]),
+                GROUP_EXPERIMENTAL: tuple(self.experimental["chi2_names"]),
+                GROUP_POSITIVITY: tuple(self.training["posdatasets"]),
+                GROUP_INTEGRABILITY: tuple(self.training["integdatasets"]),
+            }
+        )
 
         # Store a reference to the interpolator as self._scaler
         if interpolation_points:
@@ -708,34 +872,6 @@ class ModelTrainer:
 
         return reporting_list
 
-    def _train_and_fit(self, training_model, stopping_object, epochs=100) -> bool:
-        """
-        Trains the NN for the number of epochs given using
-        stopping_object as the stopping criteria
-
-        Every ``PUSH_POSITIVITY_EACH`` epochs the positivity will be multiplied by their
-        respective positivity multipliers.
-        In the same way, every ``PUSH_INTEGRABILITY_EACH`` epochs the integrability
-        will be multiplied by their respective integrability multipliers
-        """
-        callback_st = callbacks.StoppingCallback(stopping_object)
-        callback_pos = callbacks.LagrangeCallback(
-            self.training["posdatasets"],
-            self.training["posmultipliers"],
-            update_freq=PUSH_POSITIVITY_EACH,
-        )
-        callback_integ = callbacks.LagrangeCallback(
-            self.training["integdatasets"],
-            self.training["integmultipliers"],
-            update_freq=PUSH_INTEGRABILITY_EACH,
-        )
-
-        training_model.perform_fit(
-            epochs=epochs,
-            verbose=False,
-            callbacks=self.callbacks + [callback_st, callback_pos, callback_integ],
-        )
-
     def _hyperopt_override(self, params):
         """Unrolls complicated hyperopt structures into very simple dictionaries"""
         # If the input contains all parameters, then that's your dictionary of hyperparameters
@@ -750,7 +886,11 @@ class ModelTrainer:
         return params
 
     def enable_tensorboard(self, logdir, weight_freq=0, profiling=False):
-        """Enables tensorboard callback for further runs of the fitting procedure
+        """Ask the backend for a tensorboard hook and add it to the fit's diagnostics.
+
+        Tensorboard is a *capability* (contract §1.10/A3), not a callback n3fit keeps a list of:
+        the Keras backend can only offer it on its tensorflow backend, and a backend that cannot
+        raises here instead of failing later inside the loop.
 
         Parameters
         ----------
@@ -761,33 +901,44 @@ class ModelTrainer:
             profiling: bool
                 flag to enable the tensorboard profiler
         """
-        callback_tb = callbacks.gen_tensorboard_callback(
-            logdir, profiling=profiling, histogram_freq=weight_freq
+        self._diagnostic_hooks.append(
+            get_backend().tensorboard_hook(logdir, histogram_freq=weight_freq, profiling=profiling)
         )
-        self.callbacks.append(callback_tb)
 
-    def evaluate(self, stopping_object):
-        """Returns the training, validation and experimental chi2
+    def evaluate(self):
+        """The training, validation and experimental chi2 of the fitted model.
 
-        Parameters
-        ----------
-            stopping_object
-                A Stopping intance which will have associated a validation model and the
-                list of output layers that should contribute to the training chi2
+        One forward pass per group, terms applied by the engine (P4) -- n3fit no longer asks a
+        model for its loss, because a model no longer *is* a loss.  The three numbers are the ones
+        the fit output has always carried: the training chi2 restricted to the chi2 terms, the
+        validation chi2 the stopping rule ended on, and the experimental chi2 per point of the
+        (fold-aware) experimental set.
 
         Returns
         -------
-            train_chi2: chi2 of the trainining set
-            val_chi2 : chi2 of the validation set
-            exp_chi2: chi2 of the experimental data (without replica or tr/vl split)
+            train_chi2: chi2 of the trainining set, per replica
+            val_chi2 : chi2 of the validation set, per replica
+            exp_chi2: chi2 of the experimental data, per replica
         """
-        if self.training["model"] is None:
-            raise RuntimeError("Modeltrainer.evaluate was called before any training")
-        # Needs to receive a `stopping_object` in order to select the part of the
-        # training and the validation which are actually `chi2` and not part of the penalty
-        train_chi2 = stopping_object.evaluate_training(self.training["model"])
-        val_chi2 = stopping_object.vl_chi2
-        exp_chi2 = self.experimental["model"].compute_losses()["loss"] / self.experimental["ndata"]
+        if not self.terms:
+            raise RuntimeError("ModelTrainer.evaluate was called before any training")
+        groups = dict(self.objective_groups.terms)
+        if self.no_validation:
+            groups[GROUP_VALIDATION] = groups[GROUP_TRAINING]
+        train = self.optimizer.evaluate(self.ensemble, self.terms, GROUP_TRAINING)
+        validation = self.optimizer.evaluate(self.ensemble, self.terms, GROUP_VALIDATION)
+        experimental = self.optimizer.evaluate(self.ensemble, self.terms, GROUP_EXPERIMENTAL)
+        # ``_parse_chi2`` is the engine's own arithmetic (sum over the named terms, divided by
+        # their points), so the reported chi2 cannot drift from the one the stopping saw.
+        train_chi2, _ = _parse_chi2(train, _ndata_for_terms(
+            self.training["chi2_names"], self._chi2_reporting, "ndata"
+        ))
+        val_chi2, _ = _parse_chi2(validation, _ndata_for_terms(
+            self.validation["chi2_names"], self._chi2_reporting, "ndata_vl"
+        ))
+        exp_chi2, _ = _parse_chi2(experimental, _ndata_for_terms(
+            self.experimental["chi2_names"], self._chi2_reporting, "ndata"
+        ))
         return train_chi2, val_chi2, exp_chi2
 
     def _filter_datagroupspec(self, datasets_partition, filter_in=True):
@@ -904,9 +1055,6 @@ class ModelTrainer:
         l_valid = []
         l_exper = []
         l_hyper = []
-        # And lists to save hyperopt utilities
-        pdfs_per_fold = []
-        exp_models = []
         # Hyperopt metrics evaluated over training/validation exp data
         trvl_chi2_per_fold = []
         trvl_phi2_per_fold = []
@@ -984,76 +1132,189 @@ class ModelTrainer:
             )
 
             if photons:
+                # The grid lives in the graph as a bound input; the view rebinds it (and
+                # rebuilds the graph, and does nothing at all if the fit has no photon).
+                backend = get_backend()
+                photon_grid = backend.ops.to_numpy(xinput.input.tensor_content)
                 if self._scaler:  # select only the non-scaled input
-                    pdf_model.get_layer("add_photon").register_photon(
-                        xinput.input.tensor_content[:, :, 1:]
-                    )
-                else:
-                    pdf_model.get_layer("add_photon").register_photon(xinput.input.tensor_content)
+                    photon_grid = photon_grid[:, :, 1:]
+                backend.view(pdf_model).bind_input("photon", photon_grid)
 
             # Model generation joins all the different observable layers
             # together with pdf model generated above
             models = self._model_generation(xinput, pdf_model, partition, k)
 
-            # After model generation, apply possible weights files.
-            # The possibilities are a single model file (`load:`)
-            # so that every replica starts with the same weights
-            # or a weight per replica from `load_weights_from_fit`
-            if self.model_file:
-                log.info("Applying model file %s", self.model_file)
-                pdf_model.load_identical_replicas(self.model_file)
-
-            if self.load_weights_dict:
-                for replica in self.replicas:
-                    weights_path = self.load_weights_dict[replica]
-                    log.info("Loading weights from path: " + str(weights_path))
-                    pdf_model.set_replica_weights_from_file(weights_path)
+            # After model generation, apply possible weights files (P5's ``n3fit-weights/2``
+            # files, one replica each).  The possibilities are a single model file (``load:``),
+            # broadcast so that every replica starts with the same weights, or one file per
+            # replica from ``load_weights_from_fit`` -- which the legacy code loaded into slot 0
+            # every time (it never passed the replica index); the store loads each file into its
+            # own replica.
+            if self.model_file or self.load_weights_dict:
+                backend = get_backend()
+                weight_ensemble = backend.ensemble(
+                    {GROUP_TRAINING: pdf_model}, weights_graph=pdf_model
+                )
+                if self.model_file:
+                    log.info("Applying model file %s", self.model_file)
+                    backend.load(weight_ensemble, self.model_file)
+                if self.load_weights_dict:
+                    for slot, replica in enumerate(self.replicas):
+                        weights_path = self.load_weights_dict[replica]
+                        log.info("Loading weights from path: %s", weights_path)
+                        backend.load(weight_ensemble, weights_path, replica=slot)
 
             if k > 0:
-                # Reset the positivity and integrability multipliers
-                pos_and_int = self.training["posdatasets"] + self.training["integdatasets"]
-                initial_values = self.training["posinitials"] + self.training["posinitials"]
-                models["training"].reset_layer_weights_to(pos_and_int, initial_values)
+                # Reset the positivity and integrability multipliers to the values their terms
+                # were built with.  ``set_scalar`` *sets* (the legacy LagrangeCallback *scales*),
+                # which is exactly what a reset is, and it goes through the contract instead of
+                # poking the weights of a graph by layer name.
+                #
+                # This used to pass ``posinitials + posinitials`` for
+                # ``posdatasets + integdatasets``, i.e. the *positivity* initial was also used for
+                # integrability and, when there were more terms than initials, the last ones were
+                # never reset at all (a runcard with ``positivity: initial`` !=
+                # ``integrability: initial`` is all it takes).  The initials now travel with the
+                # term names they belong to (``training["penalty_initials"]``).
+                for name in self.objective_groups.names(
+                    GROUP_POSITIVITY
+                ) + self.objective_groups.names(GROUP_INTEGRABILITY):
+                    self.terms[name].set_scalar(
+                        "multiplier", self.training["penalty_initials"][name]
+                    )
 
-            # Generate the list containing reporting info necessary for chi2
+            # Generate the list containing reporting info necessary for chi2.  Kept on the
+            # instance: ``evaluate`` normalizes by the same numbers the stopping used.
             reporting = self._prepare_reporting(partition)
+            self._chi2_reporting = [entry for entry in reporting if entry.get("count_chi2")]
 
             if self.no_validation:
-                # Substitute the validation model with the training model
+                # Substitute the validation model with the training model: with nothing held out,
+                # the validation objective *is* the training one (the legacy read the validation
+                # numbers out of the training model's logs), so the group membership follows.
                 models["validation"] = models["training"]
-                validation_model = models["training"]
-            else:
-                validation_model = models["validation"]
 
-            # Generate the stopping_object this object holds statistical information about the fit
-            # it is used to perform stopping
-            stopping_object = Stopping(
-                validation_model,
-                reporting,
-                pdf_model,
-                total_epochs=epochs,
+            # The three role graphs, as one ensemble (P4).  ``weights_graph`` is the PDF model:
+            # the roles are built by re-applying it, so that is where the trainable weights live.
+            ensemble = get_backend().ensemble(
+                {
+                    GROUP_TRAINING: models["training"],
+                    GROUP_VALIDATION: models["validation"],
+                    GROUP_EXPERIMENTAL: models["experimental"],
+                },
+                weights_graph=pdf_model,
+            )
+            groups = dict(self.objective_groups.terms)
+            if self.no_validation:
+                groups[GROUP_VALIDATION] = groups[GROUP_TRAINING]
+
+            # What the stopping decides on: the *term names* of each role, with the number of
+            # points each carries.  ``_prepare_reporting`` gives the points per experiment (and
+            # per fold); the names come from the generators, in the same order.
+            chi2_entries = [entry for entry in reporting if entry.get("count_chi2")]
+            tr_ndata = _ndata_for_terms(self.training["chi2_names"], chi2_entries, "ndata")
+            vl_ndata = _ndata_for_terms(self.validation["chi2_names"], chi2_entries, "ndata_vl")
+            if self.no_validation:
+                vl_ndata = None  # the hook watches the training terms then (legacy behaviour)
+
+            # The record of the fit (P4): filled by the stopping hook as the fit runs, read
+            # afterwards by the reporting -- under the names the legacy ``Stopping`` object used.
+            record = FitRecord()
+            stopping_object = StoppingHook(
+                record,
+                ensemble,
+                ndata=tr_ndata,
+                vl_ndata=vl_ndata,
+                positivity_terms=self.validation["penalty_names"],
+                total_steps=epochs,
                 stopping_patience=stopping_epochs,
                 stopping_delta=stopping_delta,
-                threshold_positivity=threshold_pos,
                 threshold_chi2=threshold_chi2,
+                threshold_positivity=threshold_pos,
             )
+            hooks = [
+                stopping_object,
+                # The schedule scales the *training* penalty of each group; the validation
+                # positivity term is deliberately not in here (see ``_generate_observables``).
+                LagrangeHook(
+                    {
+                        name: self.terms[name]
+                        for name in self.objective_groups.names(GROUP_POSITIVITY)
+                    },
+                    dict(
+                        zip(
+                            self.objective_groups.names(GROUP_POSITIVITY),
+                            self.training["posmultipliers"],
+                        )
+                    ),
+                    period=PUSH_POSITIVITY_EACH,
+                ),
+                LagrangeHook(
+                    {
+                        name: self.terms[name]
+                        for name in self.objective_groups.names(GROUP_INTEGRABILITY)
+                    },
+                    dict(
+                        zip(
+                            self.objective_groups.names(GROUP_INTEGRABILITY),
+                            self.training["integmultipliers"],
+                        )
+                    ),
+                    period=PUSH_INTEGRABILITY_EACH,
+                ),
+                LogHook(),
+                *self._diagnostic_hooks,
+            ]
 
             if self.mode_hyperopt or (not self.trials):
-                optimizer_params = params["optimizer"]
+                optimizer_params = dict(params["optimizer"])
             else:
                 idx_hyperparamters = self.replicas[0] % self.trials["number_of_trials"]
-                optimizer_params = {}
-                optimizer_params["clipnorm"] = self.trials['clipnorm'][idx_hyperparamters]
-                optimizer_params["learning_rate"] = self.trials['learning_rate'][idx_hyperparamters]
-                optimizer_params["optimizer_name"] = self.trials['optimizer'][idx_hyperparamters]
+                optimizer_params = {
+                    "clipnorm": self.trials['clipnorm'][idx_hyperparamters],
+                    "learning_rate": self.trials['learning_rate'][idx_hyperparamters],
+                    "optimizer_name": self.trials['optimizer'][idx_hyperparamters],
+                }
+            optimizer_spec = OptimizerSpec(
+                optimizer_params.pop("optimizer_name"), optimizer_params
+            )
 
-            # Compile each of the training/validation models with the same  optimization parameters
-            for model in models.values():
-                model.compile(**optimizer_params)
-            self._train_and_fit(models["training"], stopping_object, epochs=epochs)
+            # Ask the backend whether this combination can be built at all, before building it
+            # (contract ``Backend.check_feasible``; it is what used to surface as a
+            # ``NotImplementedError`` from inside ``MetaModel.compile``).
+            backend = get_backend()
+            backend.check_feasible(
+                _parametrization_spec(replicas_settings),
+                optimizer_spec,
+                self.terms[self.objective_groups.names(GROUP_TRAINING)[0]].spec,
+            )
+
+            # n3fit monitors at the engine's default interval unless the runcard asked for a
+            # coarser one (D6); the backend may impose a minimum.
+            optimizer = backend.optimizer(optimizer_spec)
+            monitor_every = max(
+                params.get("monitor_every", 1), optimizer.min_monitor_interval()
+            )
+            self.optimizer = optimizer
+            self.ensemble = ensemble
+            optimizer.run(
+                ensemble,
+                self.terms,
+                groups,
+                steps=epochs,
+                monitor_every=monitor_every,
+                hooks=hooks,
+            )
+            # The training chi2 of the *fitted* model -- what the legacy ``Stopping`` computed on
+            # demand (``evaluate_training``).  A closure, so a consumer reads it exactly once.
+            record._training_evaluation = (
+                lambda ensemble=ensemble: self.optimizer.evaluate(
+                    ensemble, self.terms, GROUP_TRAINING
+                )
+            )
 
             if self.mode_hyperopt:
-                validation_loss = stopping_object.vl_chi2
+                validation_loss = record.vl_chi2
 
                 # number of active points in this fold
                 # it would be nice to have a ndata_per_fold variable coming in the vp object...
@@ -1062,8 +1323,14 @@ class ModelTrainer:
                 if ndata == 0:
                     ndata = self.experimental["ndata"]
 
-                # Compute experimental loss, over excluded datasets
-                exp_loss_raw = models["experimental"].compute_losses()["loss"]
+                # Compute experimental loss over the excluded datasets: the sum of the
+                # experimental terms (per replica), per point.
+                exp_terms = self.optimizer.evaluate(
+                    ensemble, self.terms, GROUP_EXPERIMENTAL
+                )
+                exp_loss_raw = sum(
+                    np.asarray(value) for value in exp_terms.values()
+                )
                 experimental_loss = exp_loss_raw / ndata
 
                 # Compute penalties per replica
@@ -1078,7 +1345,7 @@ class ModelTrainer:
                 folded_datasets = partition["datasets"]
                 experimental_data = self._filter_datagroupspec(folded_datasets)
 
-                vplike_pdf = N3PDF(pdf_model.split_replicas())
+                vplike_pdf = N3PDF(get_backend().ensemble(pdf_model))
                 if self.boundary_condition is not None:
                     vplike_pdf.register_boundary(self.boundary_condition["unpolarized_bc"])
 
@@ -1106,8 +1373,6 @@ class ModelTrainer:
                 trvl_chi2exp_per_fold.append(hyper_metrics.chi2exp)
                 trvl_phi2_per_fold.append(hyper_metrics.phi2)
                 trvl_logp_per_fold.append(hyper_metrics.logp)
-                pdfs_per_fold.append(pdf_model)
-                exp_models.append(models["experimental"])
 
                 if hyper_loss > self.hyper_threshold:
                     log.info(
@@ -1172,10 +1437,10 @@ class ModelTrainer:
         self.experimental["model"] = models["experimental"]
         self.validation["model"] = models["validation"]
 
-        # In a normal run, the only information we need to output is the stopping object
-        # (which contains metadata about the stopping)
+        # In a normal run, the only information we need to output is the record of the fit
+        # (metadata about the stopping, under the names the reporting uses)
         # and the pdf model (which are used to generate the PDF grids and compute arclengths)
         if not self.mode_hyperopt:
-            passed = any(bool(i) for i in stopping_object.e_best_chi2)
-        dict_out = {"status": passed, "stopping_object": stopping_object, "pdf_model": pdf_model}
+            passed = any(bool(i) for i in record.e_best_chi2)
+        dict_out = {"status": passed, "stopping_object": record, "pdf_model": pdf_model}
         return dict_out

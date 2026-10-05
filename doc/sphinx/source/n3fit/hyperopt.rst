@@ -310,53 +310,19 @@ Beyond the usual :math:`\chi2`-based optimization figures above, it is possible 
 Future tests
 ~~~~~~~~~~~~
 
-One possibility is to use a :ref:`future test<futuretests>`-based metric for which the goal is not to get the minimum :math:`\chi2` but to get the same :math:`\chi2` (with PDF errors considered) for different datasets. The idea is that this way we select models of which the prediction is stable upon variations in the dataset.
-In order to obtain the PDF errors used in the figure of merit it is necessary to run multiple replicas, luckily ``n3fit`` provides such a possibility also during hyperoptimization.
+A future-test metric -- selecting models whose prediction is stable when a group of datasets is
+left out of the fit, rather than those with the smallest :math:`\chi^2` -- is no longer shipped as
+its own target.  The function that implemented it (``fit_future_tests``) had not been reachable for
+several releases: the k-fold loss stopped being dispatched by name when ``HyperLoss`` became a class
+(``fold_statistic`` is validated against ``IMPLEMENTED_STATS``, and no implementation of the
+future-test figure of merit was ever registered there), while the documented ``target:`` key was not
+the key the code read.  It was removed rather than documented further.
 
-Take the following modifications to a normal hyperopt runcard
-(note that for convenience we take the trials directly from a previous run, so we don't have to create a new
-hyperopt configuration dictionary).
-
-.. code-block:: yaml
-
-        dataset_inputs:
-        - {dataset: NMC_NC_NOTFIXED_EM-F2, frac: 0.75, variant: legacy_dw}
-        - {dataset: NMC_NC_NOTFIXED_P_EM-SIGMARED, frac: 0.75, variant: legacy}
-        - {dataset: SLAC_NC_NOTFIXED_P_EM-F2, frac: 0.75, variant: legacy_dw}
-        - {dataset: SLAC_NC_NOTFIXED_D_EM-F2, frac: 0.75, variant: legacy_dw}
-        - {dataset: BCDMS_NC_NOTFIXED_P_EM-F2, frac: 0.75, variant: legacy_dw}
-        - {dataset: BCDMS_NC_NOTFIXED_D_EM-F2, frac: 0.75, variant: legacy_dw}
-        - {dataset: HERA_NC_251GEV_EP-SIGMARED, frac: 0.75, variant: legacy}
-        - {dataset: HERA_CC_318GEV_EM-SIGMARED, frac: 0.75, variant: legacy}
-        - {dataset: HERA_CC_318GEV_EP-SIGMARED frac: 0.75, variant: legacy}
-
-        hyperscan_config:
-          use_tries_from: 210508-hyperopt_for_paper
-
-        kfold:
-          target: fit_future_tests
-          partitions:
-          - datasets:
-            - HERA_CC_318GEV_EP-SIGMARED
-            - HERA_CC_318GEV_EM-SIGMARED
-            - HERA_NC_251GEV_EP-SIGMARED
-          - datasets:
-
-We can run this hyperparameter scan for 10 parallel replicas for 20 trials with:
-
-.. code-block:: bash
-
-   n3fit runcard.yml 1 -r 10 --hyperopt 20
-
-The above runcard will, for a sample of 20 trials in ``210508-hyperopt_for_paper`` (according to their rewards),
-run two fits of 10 replicas each.
-The first fit will hide the data from HERA and the second one (an empty fold) will take into consideration all data.
-In order to properly set up a future test the last fold (the future) is recommended to be left as an empty fold such that no data is masked out.
-The figure of merit will be the difference between the :math:`\chi2` of the second fit to the folded data and the :math:`\chi2` of the first fit to the folded data *including* pdf errors
-(the :ref:`future test<futuretests>` :math:`\chi2`).
-
-.. math::
-   L_{\rm hyperopt} = \chi^{2}_{(1) \rm pdferr} - \chi^{2}_{(2)}
+The metric itself is expressible in the current design: it is an objective over the *experimental*
+group (a chi2 whose covariance has the PDF-error contribution added), which is exactly what
+``n3fit.backends.base.Objective`` and ``term.set_data(covmat=...)`` describe.  An implementation
+would be a new entry in ``hyper_optimization/rewards.py`` -- a fold statistic over that objective --
+and does not need anything from the training loop.
 
 
 New hyperoptimization metrics with fold and replica statistics

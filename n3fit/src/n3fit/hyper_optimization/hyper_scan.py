@@ -33,7 +33,7 @@ except ModuleNotFoundError:
 
 import numpy as np
 
-from n3fit.backends import MetaLayer, MetaModel
+from n3fit.backends import get_backend
 from n3fit.hyper_optimization.filetrials import FileTrials
 
 try:
@@ -410,10 +410,10 @@ class HyperScanner:
 
     def optimizer(self, optimizers):
         """
-        This function look at the optimizers implemented in MetaModel
+        This function looks at the optimizers declared by the backend (its ``Capabilities``)
         Since each optimizer can take different parameters, the input to this function, `optimizer`
         is a list of dictionaries, each defining the name of the optimizer (which needs to be
-        implemented in `n3fit`) and the options to modify.
+        implemented by the backend) and the options to modify.
 
         The accepted options are:
             - learning_rate
@@ -427,8 +427,9 @@ class HyperScanner:
         Note that the keys within the dictionary (`optimizer_name` and `learning_rate`)
         should be named as the keys used by the compiler of the model.
         """
-        # Get all accepted optimizer to check against
-        all_optimizers = MetaModel.accepted_optimizers
+        # Get all the optimizers the backend declares, to check against
+        backend = get_backend()
+        all_optimizers = backend.capabilities.optimizers
         # We will have a list of dictionaries to choose from
         choices = []
 
@@ -443,13 +444,14 @@ class HyperScanner:
 
             if name not in all_optimizers:
                 raise NotImplementedError(
-                    f"HyperScanner: Optimizer {name} not implemented in MetaModel.py"
+                    f"HyperScanner: Optimizer {name} not implemented by the "
+                    f"{backend.name!r} backend"
                 )
 
             lr_dict = optimizer.get(lr_key)
             if lr_dict is not None:
                 # Check whether this optimizer is implemented with a learning rate
-                args = all_optimizers[name][1]
+                args = all_optimizers[name]["options"]
                 if lr_key not in args.keys():
                     raise ValueError(f"Optimizer {name} does not accept {lr_key}")
                 hp_key = f"{name}_{lr_key}"
@@ -554,17 +556,17 @@ class HyperScanner:
             units.append(output_size)
             nodes_choices.append(units)
 
-        # For the initializer we need to check for the ones implemented in MetaLayer
-        imp_inits = MetaLayer.initializers
-        imp_init_names = imp_inits.keys()
+        # For the initializer we need to check against the ones declared by the backend
+        declared_initializers = get_backend().capabilities.initializers
         if initializers == "ALL":
-            initializers = imp_init_names
+            initializers = declared_initializers
 
         ini_choices = []
         for ini_name in initializers:
-            if ini_name not in imp_init_names:
+            if ini_name not in declared_initializers:
                 raise NotImplementedError(
-                    f"HyperScanner: Initializer {ini_name} not implemented in MetaLayer.py"
+                    f"HyperScanner: Initializer {ini_name} not implemented by the "
+                    f"{get_backend().name!r} backend"
                 )
             # For now we are going to use always all initializers and with default values
             ini_choices.append(ini_name)

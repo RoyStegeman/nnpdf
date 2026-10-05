@@ -77,6 +77,45 @@ def test_check_initializer():
         checks.check_initializer("Wrong_one")
 
 
+def test_checks_follow_the_backend_capabilities(monkeypatch):
+    """The checks validate input against the *backend's declarations*, not a hard-coded list.
+
+    Verified against the numpy test double, so the test says nothing about Keras: whatever a
+    backend declares is what the checks accept (this is what makes a second backend usable
+    without touching n3fit).
+    """
+    from n3fit.tests.backend_conformance.testing_backends import NumpyDoubleBackend
+
+    monkeypatch.setattr(checks, "get_backend", lambda *args, **kwargs: NumpyDoubleBackend())
+
+    checks.check_optimizer({"optimizer_name": "levenberg_marquardt", "max_iter": 3})
+    with pytest.raises(CheckError):
+        checks.check_optimizer({"optimizer_name": "RMSprop"})
+    with pytest.raises(CheckError):
+        checks.check_optimizer({"optimizer_name": "levenberg_marquardt", "learning_rate": 0.1})
+
+    checks.check_initializer("zeros")
+    with pytest.raises(CheckError):
+        checks.check_initializer("glorot_normal")
+
+
+def test_check_tensorboard_is_a_backend_capability(monkeypatch):
+    """Enabling tensorboard asks the backend whether it can, instead of importing tensorflow."""
+    from n3fit.tests.backend_conformance.testing_backends import NumpyDoubleBackend
+
+    monkeypatch.setattr(checks, "get_backend", lambda *args, **kwargs: NumpyDoubleBackend())
+    with pytest.raises(ModuleNotFoundError, match="tensorboard"):
+        checks.check_tensorboard({"weight_freq": 1})
+
+    # and with the capability declared, no framework is needed either
+    backend = NumpyDoubleBackend()
+    object.__setattr__(backend.capabilities, "supports_tensorboard", True)
+    monkeypatch.setattr(checks, "get_backend", lambda *args, **kwargs: backend)
+    checks.check_tensorboard({"weight_freq": 1})
+    with pytest.raises(CheckError):
+        checks.check_tensorboard({"weight_freq": -1})
+
+
 def test_check_dropout():
     """Test the dropout checks"""
     with pytest.raises(CheckError):

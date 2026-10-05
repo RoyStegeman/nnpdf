@@ -17,12 +17,12 @@ import pathlib
 import shutil
 import subprocess as sp
 
-import h5py
 from numpy.testing import assert_allclose, assert_equal
 import pandas as pd
 import pytest
 
 import n3fit
+from n3fit.backends.keras_backend.weights import load_weight_file
 from n3fit.io.writer import SuperEncoder
 from n3fit.tests.helpers import run_n3fit, run_setupfit
 from validphys.n3fit_data import replica_mcseed, replica_nnseed, replica_trvlseed
@@ -35,7 +35,7 @@ QUICKNAME_QED = "quickcard_qed"
 QUICKNAME_POL = "quickcard_pol"
 QUICKNAME_SEQUENTIAL = "quickcard-sequential"
 QUICKNAME_PARALLEL = "quickcard-parallel"
-WEIGHT_NAME = "weights.weights.h5"
+WEIGHT_NAME = "weights.weights.npz"
 EXE = "n3fit"
 REPLICA = "1"
 EXPECTED_MAX_FITTIME = 130  # seen mac ~ 180  and linux ~ 90
@@ -172,13 +172,20 @@ def _auxiliary_performfit(tmp_path, runcard=QUICKNAME, replica=1, timing=True, r
     quickcard = f"{runcard}.yml"
     # Prepare the runcard
     quickpath = REGRESSION_FOLDER / quickcard
-    weight_name = "weights_pol" if "_pol" in quickcard else "weights"
-    weightpath = REGRESSION_FOLDER / f"{weight_name}_{replica}.weights.h5"
+    # Each runcard family loads its own initial-weight fixture (P5: one replica per file, npz);
+    # qed's architecture differs from quickcard's, so it has its own fixture.
+    if "_pol" in quickcard:
+        weight_name = "weights_pol"
+    elif "_qed" in quickcard:
+        weight_name = "weights_qed"
+    else:
+        weight_name = "weights"
+    weightpath = REGRESSION_FOLDER / f"{weight_name}_{replica}.weights.npz"
     # read up the previous json file for the given replica
     old_json_file = REGRESSION_FOLDER / f"{runcard}_{replica}.json"
     # cp runcard and weights to tmp folder
     shutil.copy(quickpath, tmp_path)
-    shutil.copy(weightpath, tmp_path / f"{weight_name}.weights.h5")
+    shutil.copy(weightpath, tmp_path / f"{weight_name}.weights.npz")
     # run the fit
     run_n3fit(quickcard, str(replica), cwd=tmp_path, check=True)
 
@@ -266,8 +273,9 @@ def test_multireplica_runs(tmp_path, runcard):
             if name_1 > name_2:
                 path_1 = tmp_path / name_1 / runcard / "nnfit" / "replica_3" / WEIGHT_NAME
                 path_2 = tmp_path / name_2 / runcard / "nnfit" / "replica_3" / WEIGHT_NAME
-                with h5py.File(path_1, 'r') as file_1, h5py.File(path_2, 'r') as file_2:
-                    compare_weights(option_1, option_2, file_1, file_2)
+                weights_1, _ = load_weight_file(path_1)
+                weights_2, _ = load_weight_file(path_2)
+                compare_weights(option_1, option_2, weights_1, weights_2)
 
 
 @pytest.mark.linux
@@ -345,29 +353,27 @@ def test_parallel_against_sequential(tmp_path, rep_from=6, rep_to=8):
         check_fit_results(tmp_path, name_par, r, seq_json)
 
 
-def compare_weights(option_1, option_2, file_1, file_2):
-    """Reads two weight files and checks that the weights are the same between the two"""
-    for key in file_1.keys():
+def compare_weights(option_1, option_2, weights_1, weights_2):
+    """Checks that two weight maps (path -> array, as ``load_weight_file`` returns) agree"""
+    assert set(weights_1) == set(weights_2), (
+        f"`n3fit {option_1}` and `n3fit {option_2}` wrote different weight layouts: "
+        f"{sorted(set(weights_1) ^ set(weights_2))}"
+    )
+    for key in sorted(weights_1):
         # The bias is initialized to 0 and will have possibly large relative differences
-        # The bias is often saved as key == 1
-        if key == "1" or "bias" in key:
+        if key.split("/")[-1] == "bias":
             continue
-
-        if isinstance(file_1[key], h5py.Group):
-            compare_weights(option_1, option_2, file_1[key], file_2[key])
-        else:
-            weight_name = file_1[key].name
-            err_msg = f"Difference between runs `n3fit {option_1}` and `n3fit {option_2}` in weights {weight_name}"
-            assert_allclose(file_1[key][:], file_2[key][:], rtol=1e-5, atol=1e-5, err_msg=err_msg)
+        err_msg = f"Difference between runs `n3fit {option_1}` and `n3fit {option_2}` in weight {key}"
+        assert_allclose(weights_1[key], weights_2[key], rtol=1e-5, atol=1e-5, err_msg=err_msg)
 
 
 def test_md5_mismatch_is_detected(tmp_path):
     """vp-setupfit, then tamper with the runcard -> n3fit must refuse to start."""
     quickcard = f"{QUICKNAME}.yml"
     weight_name = "weights_pol" if "_pol" in quickcard else "weights"
-    weightpath = REGRESSION_FOLDER / f"{weight_name}_1.weights.h5"
+    weightpath = REGRESSION_FOLDER / f"{weight_name}_1.weights.npz"
     shutil.copy(REGRESSION_FOLDER / quickcard, tmp_path)
-    shutil.copy(weightpath, tmp_path / f"{weight_name}.weights.h5")
+    shutil.copy(weightpath, tmp_path / f"{weight_name}.weights.npz")
     run_setupfit(quickcard, cwd=tmp_path)
 
     runcard_path = tmp_path / quickcard

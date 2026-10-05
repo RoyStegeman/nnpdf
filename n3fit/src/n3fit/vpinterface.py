@@ -29,7 +29,7 @@ Example
         fitbasis="FLAVOUR",
     )
 
-    n3pdf = N3PDF(pdf_model.split_replicas())
+    n3pdf = N3PDF(get_backend().ensemble(pdf_model))
 
     res = xplotting_grid(n3pdf, 1.6, fake_x)
 
@@ -47,6 +47,8 @@ import numpy as np
 import pandas as pd
 import scipy.linalg as la
 
+from n3fit.backends import get_backend
+from n3fit.backends.base import ROLE_PREPROCESSING
 from validphys.arclength import arc_lengths, integrability_number
 from validphys.calcutils import calc_chi2, calc_phi
 from validphys.convolution import central_predictions, predictions
@@ -116,16 +118,14 @@ class N3LHAPDFSet(LHAPDFSet):
         return self.grid_values([fl], [x]).squeeze()[n]
 
     def _register_photon(self, xgrid):
-        """If the PDF models contain photons, register the xgrid with them"""
+        """If the PDF models contain photons, register the xgrid with them
+
+        The model decides whether it has a photon section at all, so the "no photon" case is a
+        no-op inside the backend rather than a lookup here.
+        """
+        backend = get_backend()
         for m in self._lhapdf_set:
-            pl = m.get_layer_re("add_photon")
-            # if pl is an empy list there's no photon
-            if not pl:
-                continue
-            pl[0].register_photon(xgrid)
-            # Recompile the model if necessary
-            if not pl[0].built:
-                m.compile()
+            backend.view(m).bind_input("photon", xgrid)
 
     def __call__(self, xarr, flavours=None, replica=None):
         """Uses the internal model to produce pdf values for the grid
@@ -155,16 +155,18 @@ class N3LHAPDFSet(LHAPDFSet):
         # Register the grid with the photon
         self._register_photon(mod_xgrid)
 
+        backend = get_backend()
+
         if replica is None or replica == 0 or self._is_t0:
             # We need generate output values for all replicas
             result = np.concatenate(
-                [m.predict({"pdf_input": mod_xgrid}) for m in self._lhapdf_set], axis=0
+                [backend.view(m)({"pdf_input": mod_xgrid}) for m in self._lhapdf_set], axis=0
             )
             if replica == 0 or self._is_t0:
                 # We want _only_ the central value
                 result = np.mean(result, axis=0, keepdims=True)
         else:
-            result = self._lhapdf_set[replica - 1].predict({"pdf_input": mod_xgrid})
+            result = backend.view(self._lhapdf_set[replica - 1])({"pdf_input": mod_xgrid})
 
         if flavours != "n3fit":
             # Ensure that the result has its flavour in the basis-defined order
@@ -277,22 +279,23 @@ class N3PDF(PDF):
         if replica is None:
             replica = 1
 
-        # Keep the import here to avoid loading the backend when it is not necessary
-        from n3fit.backends import PREPROCESSING_LAYER_ALL_REPLICAS
-
-        preprocessing_layer = self._models[replica - 1].get_layer(PREPROCESSING_LAYER_ALL_REPLICAS)
+        # The weights come back as numpy, keyed by path (contract §1.2), so there is nothing
+        # to convert here and no layer name to know.
+        preprocessing_weights = get_backend().view(self._models[replica - 1]).weights(
+            role=ROLE_PREPROCESSING
+        )
 
         alphas_and_betas = None
         if self.fit_basis is not None:
             output_dictionaries = []
             for d in self.fit_basis:
                 flavour = d["fl"]
-                alpha = preprocessing_layer.get_weight_by_name(f"alpha_{flavour}")
-                beta = preprocessing_layer.get_weight_by_name(f"beta_{flavour}")
+                alpha = preprocessing_weights.get(f"{ROLE_PREPROCESSING}/alpha/{flavour}")
+                beta = preprocessing_weights.get(f"{ROLE_PREPROCESSING}/beta/{flavour}")
                 if alpha is not None:
-                    alpha = float(alpha.numpy().squeeze())
+                    alpha = float(alpha.squeeze())
                 if beta is not None:
-                    beta = float(beta.numpy().squeeze())
+                    beta = float(beta.squeeze())
                 output_dictionaries.append(
                     {
                         "fl": flavour,
@@ -358,11 +361,13 @@ def integrability_numbers(n3pdf, q0=1.65, flavours=None):
             ReplicaSettings(nodes=[8], activations=["linear"], seed=0)
         ]
 
-        pdf_model = generate_pdf_model(
-            settings,
-            flav_info=fake_fl,
-            fitbasis="FLAVOUR",
-        ).split_replicas()
+        pdf_model = get_backend().ensemble(
+            generate_pdf_model(
+                settings,
+                flav_info=fake_fl,
+                fitbasis="FLAVOUR",
+            )
+        )
 
         n3pdf = N3PDF(pdf_model)
 
@@ -405,11 +410,13 @@ def compute_arclength(self, q0=1.65, basis="evolution", flavours=None):
             ReplicaSettings(nodes=[8], activations=["linear"], seed=0)
         ]
 
-        pdf_model = generate_pdf_model(
-            settings,
-            flav_info=fake_fl,
-            fitbasis="FLAVOUR",
-        ).split_replicas()
+        pdf_model = get_backend().ensemble(
+            generate_pdf_model(
+                settings,
+                flav_info=fake_fl,
+                fitbasis="FLAVOUR",
+            )
+        )
 
         n3pdf = N3PDF(pdf_model)
 
@@ -461,7 +468,7 @@ def compute_hyperopt_metrics(n3pdf, experimental_data) -> HyperoptMetrics:
             fitbasis="FLAVOUR",
         )
 
-        n3pdf = N3PDF(pdf_model.split_replicas())
+        n3pdf = N3PDF(get_backend().ensemble(pdf_model))
 
         ds = Loader().check_dataset(
             "NMC_NC_NOTFIXED_P_EM-SIGMARED",

@@ -174,11 +174,13 @@ class CoreConfig(configparser.Config):
             weights_name = fit_object.as_input().get("save")
             if weights_name is None:
                 raise LoadFailedError(f"{load_weights_from_fit} does not have saved weights")
-            # Correct for extension already included
-            if weights_name.endswith(".h5"):
-                weights_name = weights_name[:-3]
+            # Correct for extension already included (the legacy h5 suffix or the current npz one)
+            for suffix in (".weights.npz", ".npz", ".weights.h5", ".h5"):
+                if weights_name.endswith(suffix):
+                    weights_name = weights_name[: -len(suffix)]
+                    break
             weights_dict = {}
-            for p in fit_folder.glob(f"replica_*/{weights_name}.weights.h5"):
+            for p in fit_folder.glob(f"replica_*/{weights_name}.weights.npz"):
                 replica_folder = p.parent.name
                 replica_index = int(replica_folder.split("_")[1])
                 weights_dict[replica_index] = p
@@ -1649,7 +1651,7 @@ class CoreConfig(configparser.Config):
 
         lock_token = "_defaults.lock.yaml"
         try:
-            return yaml.load(read_text(validphys.cuts.lockfiles, f"{spec}{lock_token}"))
+            return yaml_safe.load(read_text(validphys.cuts.lockfiles, f"{spec}{lock_token}"))
         except FileNotFoundError as e:
             alternatives = alternatives = [
                 el.strip(lock_token)
