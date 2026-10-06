@@ -65,6 +65,7 @@ print("capabilities build with all frameworks stubbed")
 '''
 
 
+
 def test_keras_capabilities_are_buildable_without_a_framework():
     result = subprocess.run(
         [sys.executable, "-c", SCRIPT],
@@ -79,3 +80,36 @@ def test_keras_capabilities_are_buildable_without_a_framework():
         f"have caught).\\n--- stdout ---\\n{result.stdout}\\n--- stderr ---\\n{result.stderr}"
     )
     assert "capabilities build" in result.stdout
+
+
+def test_debug_state_configuration_does_not_assume_tensorflow_for_jax():
+    script = r'''
+import sys
+import types
+
+keras = types.ModuleType("keras")
+keras.backend = types.SimpleNamespace(
+    backend=lambda: "jax",
+    clear_session=lambda: None,
+    set_floatx=lambda dtype: None,
+)
+keras.utils = types.SimpleNamespace(set_random_seed=lambda seed: None)
+sys.modules["keras"] = keras
+sys.modules["jax"] = types.ModuleType("jax")
+
+from n3fit.backends.keras_backend.internal_state import set_initial_state
+set_initial_state(debug=True)
+print("jax debug-state setup passed")
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        env={"PYTHONPATH": ":".join(sys.path)},
+        check=False,
+    )
+    assert result.returncode == 0, (
+        "debug initialization must not reference TensorFlow under the JAX backend."
+        f"\\n--- stdout ---\\n{result.stdout}\\n--- stderr ---\\n{result.stderr}"
+    )
+    assert "jax debug-state setup passed" in result.stdout

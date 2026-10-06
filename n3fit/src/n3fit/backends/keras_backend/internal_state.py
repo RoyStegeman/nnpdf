@@ -202,7 +202,8 @@ def set_initial_state(debug=False, external_seed=None, max_cores=None, double_pr
     if debug and max_cores is None:
         keras.utils.set_random_seed(7331)
         threads = 1
-        tf.config.experimental.enable_op_determinism()
+        if K.backend() == "tensorflow":
+            tf.config.experimental.enable_op_determinism()
     set_number_of_cores(max_cores=max_cores, max_threads=threads, double_precision=double_precision)
 
     # Once again, if in debug mode or external_seed set, set also the TF seed

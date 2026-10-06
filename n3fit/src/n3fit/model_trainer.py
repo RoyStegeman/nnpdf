@@ -1333,9 +1333,10 @@ class ModelTrainer:
                 )
                 experimental_loss = exp_loss_raw / ndata
 
-                # Compute penalties per replica
+                # Penalties consume the FitRecord's read-side results (best epochs, validation
+                # chi2, and patience), not the StoppingHook that makes the stopping decisions.
                 penalties = {
-                    penalty.__name__: penalty(pdf_model=pdf_model, stopping_object=stopping_object)
+                    penalty.__name__: penalty(pdf_model=pdf_model, stopping_object=record)
                     for penalty in self.hyper_penalties
                 }
 

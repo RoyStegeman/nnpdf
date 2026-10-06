@@ -4,7 +4,10 @@ Test the penalties for n3fit hyperopt
 
 from types import SimpleNamespace
 
+import numpy as np
+
 from n3fit.hyper_optimization.penalties import integrability, patience, saturation
+from n3fit.stopping import FitRecord
 from n3fit.model_gen import ReplicaSettings, generate_pdf_model
 
 
@@ -29,6 +32,21 @@ def test_patience():
     )
     res = patience(stopping_object=fake_stopping, alpha=1e-4)
     assert isinstance(res, float)
+
+
+def test_patience_accepts_fit_record():
+    """The hyperopt penalty consumes the record produced by the P4 stopping hook."""
+    record = FitRecord()
+    record.best_epochs = [1000]
+    record.stop_epochs = [1200]
+    record.stopping_patience = 500
+    record.total_steps = 5000
+    record.vl_chi2 = np.array([2.42])
+
+    result = patience(stopping_object=record, alpha=1e-4)
+
+    expected = 2.42 * np.exp(1e-4 * abs(5000 - 500 - 1000))
+    np.testing.assert_allclose(result, [expected])
 
 
 def test_integrability_numbers():

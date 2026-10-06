@@ -1,4 +1,5 @@
 import numpy as np
+from keras.optimizers import RMSprop
 
 from n3fit.backends import Input, Lambda, MetaModel
 from n3fit.backends import operations as op
@@ -87,7 +88,7 @@ def test_constraint():
     prefactors = prepro(x)
     scalar = Lambda(lambda x: op.sum(x, axis=(1, 2, 3)))(prefactors)
     model = MetaModel(input_tensors={'pdf_input': x}, output_tensors=scalar)
-    model.compile(loss='mse', learning_rate=1e-15)
+    model.compile(loss='mse', optimizer=RMSprop(learning_rate=1e-15))
 
     # Simulate training where weights of replica 1 are updated to violate the constraint
     prepro.weights[0].assign(10.0 * prepro.weights[0])
