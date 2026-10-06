@@ -51,11 +51,11 @@ Design notes (see ``n3fit-backend-contract.md`` for the full rationale):
   :attr:`Capabilities.train_n_replicas_together`.
 * Weights are exchanged as ``{path: numpy.ndarray}`` maps, one map per ensemble member.
   The path grammar is ``role[/<index or flavour>][/<layer>]/<parameter>`` with roles
-  ``parametrization``, ``preprocessing``, ``objective`` (and structural roles such as
-  ``sumrule``/``photon``), e.g. ``parametrization/0/kernel``, ``parametrization/c`` (a
-  polynomial coefficient), ``preprocessing/alpha/u``, ``objective/LHC_exp/mask``.  This is
-  simultaneously the snapshot format (best weights during training), the mutation format
-  (masks, Lagrange multipliers) and the on-disk format.
+  ``nn``, ``preprocessing``, ``objective`` (and structural roles such as ``sumrule``/``photon``),
+  e.g. ``nn/0/kernel``, ``nn/c`` (a polynomial coefficient), ``preprocessing/alpha/u``,
+  ``objective/LHC_exp/mask``. Backends may use their own graph/layer names internally, but those
+  names do not appear in these paths. This is simultaneously the snapshot format (best weights
+  during training), the mutation format (masks, Lagrange multipliers) and the on-disk format.
 * The engine's unit is the *optimizer step*, per ensemble member.  Hooks fire at *monitored
   steps*, which happen every ``monitor_every`` steps (>= :meth:`Optimizer.min_monitor_interval`).
   Schedules (positivity multipliers, ...) and stopping patience are expressed in optimizer

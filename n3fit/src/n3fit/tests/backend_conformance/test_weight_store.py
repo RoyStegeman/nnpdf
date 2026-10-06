@@ -21,7 +21,7 @@ pytest.importorskip("keras")
 from n3fit.backends.keras_backend import weights as store  # noqa: E402
 from n3fit.backends.keras_backend.backend import KerasBackend  # noqa: E402
 from n3fit.backends.keras_backend.roles import KerasRoleEnsemble  # noqa: E402
-from n3fit.backends.base import GROUP_TRAINING  # noqa: E402
+from n3fit.backends.base import GROUP_TRAINING, ROLES, role_of  # noqa: E402
 from n3fit.model_gen import ReplicaSettings, generate_pdf_model  # noqa: E402
 
 FLAV_INFO = [
@@ -42,6 +42,19 @@ def _settings(seed0, n_replicas):
     ]
 
 
+def _heterogeneous_settings():
+    """Different hidden widths model the per-replica architectures used by hyperopt."""
+    return [
+        ReplicaSettings(
+            nodes=nodes,
+            activations=["sigmoid", "tanh", "linear"],
+            initializer="glorot_normal",
+            seed=100 + i,
+        )
+        for i, nodes in enumerate(([6, 5, 8], [6, 7, 8]))
+    ]
+
+
 @pytest.fixture(scope="module")
 def two_replica_model():
     return generate_pdf_model(_settings(10, 2), flav_info=FLAV_INFO, fitbasis="EVOL")
@@ -57,6 +70,9 @@ def test_the_path_set_is_replica_independent(two_replica_model):
     maps = [store.weight_shapes(two_replica_model, replica=i) for i in range(2)]
     assert maps[0] == maps[1]
     assert set(maps[0]) == set(store.weight_map(two_replica_model, 0))
+    assert all(role_of(path) in ROLES for path in maps[0])
+    assert "nn/0/kernel" in maps[0]
+    assert any(path.startswith("preprocessing/") for path in maps[0])
 
 
 def test_single_and_multi_replica_graphs_have_the_same_layout(two_replica_model, one_replica_model):
@@ -156,8 +172,9 @@ def test_save_writes_one_replica_and_load_broadcasts_it(tmp_path, backend, two_r
     single = store.weight_map(two_replica_model, 0)
     path = tmp_path / "warmstart.weights.npz"
     backend.save(two_replica_model, path)  # a raw graph saves replica 0
-    read_back, _ = store.load_weight_file(path)
+    read_back, manifest = store.load_weight_file(path)
     assert set(read_back) == set(single)
+    assert manifest["n_replicas_graph"] == 2
 
     ensemble = _ensemble_of(two_replica_model)
     # perturb both replicas, then broadcast the file back into all of them
@@ -191,6 +208,25 @@ def test_load_into_one_replica_only(tmp_path, backend, two_replica_model):
         for k in replica_one
     )
     store.assign_weight_map(two_replica_model, replica_zero, replica=0)  # restore
+
+
+def test_broadcast_prevalidates_every_replica_before_mutating(tmp_path, backend):
+    """An incompatible later replica must not leave earlier replicas loaded."""
+    model = generate_pdf_model(_heterogeneous_settings(), flav_info=FLAV_INFO, fitbasis="EVOL")
+    ensemble = _ensemble_of(model)
+    before = [
+        {key: value.copy() for key, value in store.weight_map(model, replica=i).items()}
+        for i in range(2)
+    ]
+    path = tmp_path / "heterogeneous.weights.npz"
+    store.save_weight_file(path, before[0])
+
+    with pytest.raises(ValueError, match="shape"):
+        backend.load(ensemble, path)
+
+    after = [store.weight_map(model, replica=i) for i in range(2)]
+    for expected, actual in zip(before, after):
+        assert all(np.array_equal(expected[key], actual[key]) for key in expected)
 
 
 def test_saving_a_multi_replica_ensemble_is_an_error(tmp_path, backend, two_replica_model):

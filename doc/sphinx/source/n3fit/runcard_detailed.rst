@@ -421,21 +421,30 @@ Save and load weights of the model
 
 .. code-block:: yaml
 
-    save: "weights.h5"
-    load: "weights.h5"
+    save: "weights.h5"  # accepted legacy spelling; writes weights.weights.npz
+    load: "/absolute/path/to/fit/nnfit/replica_1/weights.weights.npz"
+
+``save`` accepts a bare name or a name ending in ``.h5``, ``.weights.h5``, ``.npz``, or
+``.weights.npz``; the writer normalizes each form to ``<stem>.weights.npz`` inside every replica
+folder. The payload is the new ``n3fit-weights/2`` npz schema even when the runcard still says
+``.h5``. Existing HDF5 weight files are not loadable. Manifest keys use backend-neutral contract
+roles (for example, ``nn/0/kernel`` and ``preprocessing/0/alpha_up``), not Keras layer names.
+
+``load`` reads one new-schema file and broadcasts those weights to every replica. Alternatively,
+use ``load_weights_from_fit`` to load the corresponding per-replica file from a previous fit in the
+``resultspath`` directory:
+
+.. code-block:: yaml
+
+    save: "weights"
     load_weights_from_fit: NNPDF40_nnlo_as_01180_qcd
 
-- ``save``: saves the weights of the PDF model in the selected file in the replica folder.
-- ``load``: loads the weights of the PDF model from the selected file. Each replica will load the same weights from this file.
-- ``load_weights_from_fit``: loads the weights of the PDF model from a previous fit located in the `resultspath` directory.
-  This requires that the fit contains the saved weights. Each replica loads the weights from the corresponding replica of the specified fit.
+The selected fit must contain the new ``.weights.npz`` files. ``load`` and
+``load_weights_from_fit`` are mutually exclusive. A direct ``load`` path is read as an absolute
+path, while saved files are placed inside each replica folder.
 
-Since the weights depend only on the architecture of the Neural Network,
-it is possible to save the weights of a Neural Network trained with one set of hyperparameters and experiments
-and load it in a different runcard and continue the training from there.
-
-While the load file is read as an absolute path, the file to save to will be found
-inside the replica folder.
+Since the weights depend on the architecture of the Neural Network, they can be saved from a fit
+and loaded into a different runcard when the weight layout is compatible.
 
 Saving and loading fit pseudodata
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

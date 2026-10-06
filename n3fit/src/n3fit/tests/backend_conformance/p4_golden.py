@@ -231,9 +231,9 @@ def environment():
 
 
 def _natural_key(text):
-    """Sort ``section/10/x`` after ``section/2/x``: numbers compare as numbers.
+    """Sort ``role/10/x`` after ``role/2/x``: numbers compare as numbers.
 
-    The weight maps moved from ``{section: [arrays]}`` to ``{section/index/name}`` paths (P5),
+    The weight maps moved from ``{section: [arrays]}`` to ``{role/index/name}`` paths (P5),
     and a lexicographic sort would interleave index 10..15 between 1 and 2 -- the order must be
     the map's own (build order) for the two serializations to flatten alike.
     """

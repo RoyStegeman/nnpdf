@@ -49,7 +49,7 @@ class KerasWeightsView:
 
     ``get()`` returns the weight store's ``{path: array}`` mapping (P5), so a hook can snapshot
     (``get``) and restore (``update``) without knowing anything about the graph.  ``assign``
-    addresses one weight by its store path (``section/index/name``), or -- as a fallback for
+    addresses one weight by its store path (``role/index/name``), or -- as a fallback for
     graphs where it is unambiguous -- by a layer name that owns a single weight.
     """
 

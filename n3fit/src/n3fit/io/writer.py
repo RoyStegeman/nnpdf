@@ -15,6 +15,7 @@ import n3fit
 from n3fit import vpinterface
 from n3fit.backends import get_backend
 import validphys
+from validphys.n3fit_weights import n3fit_weights_filename
 from validphys.utils import yaml_safe
 
 log = logging.getLogger(__name__)
@@ -354,15 +355,12 @@ class WriterWrapper:
         """Save the weights of replica ``i`` in the ``n3fit-weights/2`` schema (P5).
 
         One replica per file, npz, keyed by the weight store's paths with a manifest inside.
-        Runcards written for the legacy format give ``.h5`` names; those are kept but end in
-        ``.npz`` now (the h5 schema is retired, D8), and a name with no recognized suffix gets
-        ``.weights.npz`` appended, which is what the bare names of older fits used to produce.
+        Legacy runcard names are accepted as input, but all names are normalized to
+        ``<stem>.weights.npz`` by the helper shared with validphys' fit resolver.  The old h5
+        payload itself is retired (D8).
         """
         out_path = Path(out_path)
-        if out_path.name.endswith(".h5"):
-            out_path = out_path.with_name(out_path.name[: -len(".h5")] + ".npz")
-        elif not out_path.name.endswith(".npz"):
-            out_path = out_path.with_name(out_path.name + ".weights.npz")
+        out_path = out_path.with_name(n3fit_weights_filename(out_path.name))
         log.info(" > Saving the weights for future in %s", out_path)
         # Extract model out of N3PDF
         model = self.pdf_objects[i]._models[0]

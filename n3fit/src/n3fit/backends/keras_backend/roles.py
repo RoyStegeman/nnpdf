@@ -461,12 +461,20 @@ class KerasEnsembleView:
 
     def set_weights(self, values):
         """Restore per-replica weights from storage maps (the inverse of :meth:`weights`)."""
-        from n3fit.backends.keras_backend.weights import assign_weight_map
+        from n3fit.backends.keras_backend.weights import assign_weight_map, validate_weight_map
 
         if len(values) != len(self._models):
             raise ValueError(f"expected {len(self._models)} replica weight maps, got {len(values)}")
         for model, replica_weights in zip(self._models, values):
+            validate_weight_map(model._graph, replica_weights, replica=0)
+        for model, replica_weights in zip(self._models, values):
             assign_weight_map(model._graph, replica_weights, replica=0)
+
+    def _validate_replica(self, values, replica):
+        """Backend-internal preflight; this view stores one graph per replica."""
+        from n3fit.backends.keras_backend.weights import validate_weight_map
+
+        validate_weight_map(self._models[replica]._graph, values, replica=0)
 
     def _assign_replica(self, values, replica):
         """Backend-internal: load one replica's storage map (``Backend.load``)."""
@@ -572,13 +580,21 @@ class KerasRoleEnsemble:
         return [weight_map(graph, replica=i) for i in range(self.n_replicas)]
 
     def set_weights(self, values):
-        """Restore per-replica weights from storage maps (the snapshot/restore the stopping hook needs)."""
-        from n3fit.backends.keras_backend.weights import assign_weight_map
+        """Restore per-replica storage maps snapshotted by the stopping hook."""
+        from n3fit.backends.keras_backend.weights import assign_weight_map, validate_weight_map
 
         if len(values) != self.n_replicas:
             raise ValueError(f"expected {self.n_replicas} replica weight maps, got {len(values)}")
         for i, replica_weights in enumerate(values):
+            validate_weight_map(self._weights_graph, replica_weights, replica=i)
+        for i, replica_weights in enumerate(values):
             assign_weight_map(self._weights_graph, replica_weights, replica=i)
+
+    def _validate_replica(self, values, replica):
+        """Backend-internal preflight for ``Backend.load`` on the shared replica graph."""
+        from n3fit.backends.keras_backend.weights import validate_weight_map
+
+        validate_weight_map(self._weights_graph, values, replica=replica)
 
     def _assign_replica(self, values, replica):
         """Backend-internal: load one replica's storage map (``Backend.load``)."""

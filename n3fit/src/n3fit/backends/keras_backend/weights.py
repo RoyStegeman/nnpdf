@@ -11,11 +11,11 @@ saved ``.h5`` used Keras's own variable paths.
 The path grammar
 ================
 
-``"{section}/{index}/{weight name}"`` -- e.g. ``all_NNs/0/kernel``, ``preprocessing_factor/3/alpha_g``.
+``"{role}/{index}/{parameter name}"`` -- e.g. ``nn/0/kernel``, ``preprocessing/3/alpha_g``.
 
-* the **section** is the top-level layer that owns the weight (``all_NNs``, ``preprocessing_factor``,
-  ``impose_msr``, ...): the thing n3fit talks about by role (``ROLE_NN`` → ``all_NNs``);
-* the **index** counts the weight's position *within its section and its replica*, in the order the
+* the **role** is the stable contract role (``nn``, ``preprocessing``, ``sumrule``, ``photon``),
+  not the backend's top-level layer name;
+* the **index** counts the weight's position *within its role and replica*, in the order the
   layers were built.  It is what makes the path replica-independent: the replicas of a fit are
   built by the same generator from the same settings, so replica 0's third kernel is replica 1's
   third kernel -- and it is also the single-replica model's third kernel, which is what lets a
@@ -27,8 +27,9 @@ Three storage layouts look the same through this grammar:
 
 * **stacked slot**: replicas that are separate sub-models (``all_NNs`` holds ``NN_0``, ``NN_1``,
   ...), each weight belonging to exactly one replica and stored whole;
-* **replica axis**: one array whose leading axis is the replica (``preprocessing_factor/alpha_g``
-  has shape ``(n_replicas, 1)``), where a replica reads ``w[i:i+1]`` and writes the same slice;
+* **replica axis**: one array whose leading axis is the replica (the Keras
+  ``preprocessing_factor/alpha_g`` weight is stored at ``preprocessing/3/alpha_g`` and has shape
+  ``(n_replicas, 1)``), where a replica reads ``w[i:i+1]`` and writes the same slice;
   the slice keeps the axis so a one-replica graph and a many-replica graph have identical array
   shapes per path -- which is what makes a file written by one loadable into the other;
 * **shared**: a weight with no replica structure at all (e.g. sum-rule integrals): every replica
@@ -44,6 +45,14 @@ import json
 import re
 
 import numpy as np
+
+from n3fit.backends.base import ROLES
+from n3fit.backends.keras_backend.roles import ROLE_LAYER_NAMES
+
+# Persist role names, never Keras' internal top-level layer names.  The Keras adapter owns the
+# translation from roles to layer names; inverting that table here keeps this serialization
+# backend-neutral at the contract boundary.
+_SECTION_TO_ROLE = {layer_name: role for role, layer_name in ROLE_LAYER_NAMES.items()}
 
 # The sub-models that hold one replica each; the legacy convention, kept because
 # ``MetaModel.is_stacked_single_replicas`` and the photon code both read it.
@@ -65,14 +74,14 @@ class WeightSlot:
       weights), or ``None`` for slot/shared weights.
     """
 
-    __slots__ = ("path", "variable", "replica", "axis", "section", "index", "layer")
+    __slots__ = ("path", "variable", "replica", "axis", "role", "index", "layer")
 
-    def __init__(self, path, variable, replica, axis, section, index, layer):
+    def __init__(self, path, variable, replica, axis, role, index, layer):
         self.path = path
         self.variable = variable
         self.replica = replica
         self.axis = axis
-        self.section = section
+        self.role = role
         self.index = index
         self.layer = layer
 
@@ -88,25 +97,47 @@ class WeightSlot:
         # path, so a file written by one loads into the other
         return value[replica : replica + 1]
 
-    def write(self, value, replica=0):
-        """Set the weight in place from ``value`` (the inverse of :meth:`read`)."""
+    def prepare(self, value, replica=0):
+        """Validate and convert a value without mutating the variable."""
         value = np.asarray(value)
+        full = np.asarray(self.variable)
+        if self.axis is None:
+            expected_shape = full.shape
+        else:
+            self._check_replica(replica)
+            expected_shape = full[replica : replica + 1].shape
+            if value.shape != expected_shape:
+                if value.shape == full[replica].shape:
+                    value = value.reshape(expected_shape)
+                else:
+                    raise ValueError(
+                        f"the weight {self.path!r} has shape {expected_shape} for one replica, "
+                        f"got {tuple(value.shape)}"
+                    )
+        if value.shape != expected_shape:
+            raise ValueError(
+                f"the weight {self.path!r} has shape {expected_shape}, got {tuple(value.shape)}"
+            )
+        try:
+            return np.asarray(value, dtype=full.dtype)
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                f"the weight {self.path!r} cannot be converted to dtype {full.dtype}"
+            ) from err
+
+    def _assign_prepared(self, value, replica=0):
+        """Assign a value already validated by :meth:`prepare`."""
         if self.axis is None:
             self.variable.assign(value)
             return
         self._check_replica(replica)
-        full = np.asarray(self.variable)
-        if value.shape != full[replica : replica + 1].shape:
-            if value.shape == np.shape(full[replica]):
-                value = value.reshape(full[replica : replica + 1].shape)
-            else:
-                raise ValueError(
-                    f"the weight {self.path!r} has shape {full[replica : replica + 1].shape} for "
-                    f"one replica, got {tuple(value.shape)}"
-                )
-        full = np.array(full)
+        full = np.array(np.asarray(self.variable), copy=True)
         full[replica : replica + 1] = value
         self.variable.assign(full)
+
+    def write(self, value, replica=0):
+        """Set the weight in place from ``value`` (the inverse of :meth:`read`)."""
+        self._assign_prepared(self.prepare(value, replica), replica)
 
     def _check_replica(self, replica):
         if replica < 0 or replica >= self.axis:
@@ -153,6 +184,20 @@ def _weight_name(variable):
     return str(name).split("/")[-1].split(":")[0]
 
 
+def _role_for_section(section):
+    """Translate a weight-bearing Keras section to its closed contract role."""
+    try:
+        role = _SECTION_TO_ROLE[section]
+    except KeyError:
+        raise ValueError(
+            f"weight-bearing Keras section {section!r} has no contract role mapping; "
+            f"known sections are {sorted(_SECTION_TO_ROLE)}"
+        ) from None
+    if role not in ROLES:
+        raise ValueError(f"the mapped role {role!r} is not part of the contract vocabulary")
+    return role
+
+
 def _walk(layer, section, replica=None):
     """Yield ``(layer, variable, replica)`` for every own weight in ``layer``'s subtree.
 
@@ -171,15 +216,16 @@ def _walk(layer, section, replica=None):
 def weight_slots(graph, replica=0):
     """Every weight of ``graph`` that belongs to ``replica``, as :class:`WeightSlot` objects.
 
-    The sections are the graph's own top-level layers (``all_NNs``, ``preprocessing_factor``,
-    ...); the order is the graph's own (depth-first, and within a layer the creation order), which
-    is what makes the index term of the path stable.  ``replica`` selects the replica whose *slot*
-    weights are returned; replica-axis and shared weights are returned for every replica, so a
-    single-replica graph and a many-replica graph have identical path sets.
+    The path prefix is the contract role for each top-level weight-bearing section (the adapter's
+    ``ROLE_LAYER_NAMES`` table supplies the Keras-to-role translation).  Within a role, ordering is
+    depth-first and follows weight creation order; the index is therefore independent of replica
+    identity. ``replica`` selects the replica whose *slot* weights are returned; replica-axis and
+    shared weights are returned for every replica, so a single-replica graph and a many-replica
+    graph have identical path sets.
     """
     slots = []
 
-    def collect(layer, variable, slot_replica, section):
+    def collect(layer, variable, slot_replica, role):
         axis = None
         if slot_replica is None:
             axis = _replica_count(layer)
@@ -192,30 +238,36 @@ def weight_slots(graph, replica=0):
                 variable=variable,
                 replica=slot_replica,
                 axis=axis,
-                section=section,
+                role=role,
                 index=0,
                 layer=layer,
             )
         )
 
-    for variable in _own_weights(graph):
-        collect(graph, variable, None, getattr(graph, "name", None) or "model")
+    graph_weights = _own_weights(graph)
+    if graph_weights:
+        graph_name = getattr(graph, "name", None) or type(graph).__name__
+        graph_role = _role_for_section(graph_name)
+        for variable in graph_weights:
+            collect(graph, variable, None, graph_role)
+
     for child in list(getattr(graph, "layers", ()) or ()):
-        section = getattr(child, "name", None) or type(child).__name__
-        for layer, variable, slot_replica in _walk(child, section):
+        keras_section = getattr(child, "name", None) or type(child).__name__
+        for layer, variable, slot_replica in _walk(child, keras_section):
             if slot_replica is not None and slot_replica != replica:
                 continue  # this sub-model builds another replica
-            collect(layer, variable, slot_replica, section)
+            role = _role_for_section(keras_section)
+            collect(layer, variable, slot_replica, role)
 
-    # Number the weights *within a section and a replica* so that the path does not depend on the
+    # Number the weights *within a role and a replica* so that the path does not depend on the
     # order in which the walk found the weights of other replicas: replica 0's third kernel,
     # replica 1's third kernel and the single-replica model's third kernel are all ``.../2/...``.
     counters = {}
     for slot in slots:
-        key = (slot.section, slot.replica)
+        key = (slot.role, slot.replica)
         slot.index = counters.get(key, 0)
         counters[key] = slot.index + 1
-        slot.path = f"{slot.section}/{slot.index}/{_weight_name(slot.variable)}"
+        slot.path = f"{slot.role}/{slot.index}/{_weight_name(slot.variable)}"
     return slots
 
 
@@ -227,14 +279,8 @@ def weight_map(graph, replica=0, *, trainable_only=False):
     return {slot.path: slot.read(replica) for slot in slots}
 
 
-def assign_weight_map(graph, values, replica=0, *, strict=True):
-    """Set the weights of one replica of ``graph`` from ``values`` (the inverse of :meth:`weight_map`).
-
-    ``strict`` compares the *sets* of paths: a mapping that does not describe this graph is an
-    error naming both sides, which turns "I loaded the wrong file" into a message instead of a
-    silently half-updated model.  With ``strict=False`` the mapping is applied key by key and an
-    unknown key is an error of the same kind (there is no use for a partial load).
-    """
+def _prepare_weight_map(graph, values, replica=0, *, strict=True):
+    """Validate paths, shapes, and conversions before any variable is changed."""
     slots = {slot.path: slot for slot in weight_slots(graph, replica=replica)}
     provided = set(values)
     known = set(slots)
@@ -248,9 +294,45 @@ def assign_weight_map(graph, values, replica=0, *, strict=True):
             f"the weight map is missing {len(known - provided)} of this graph's {len(known)} "
             f"weights, e.g. {sorted(known - provided)[:3]}"
         )
-    for path, value in values.items():
-        if path in slots:
-            slots[path].write(value, replica)
+    prepared = {path: slots[path].prepare(value, replica) for path, value in values.items()}
+    return slots, prepared
+
+
+def validate_weight_map(graph, values, replica=0, *, strict=True):
+    """Check that ``values`` can be assigned to one replica, without mutating the graph."""
+    _prepare_weight_map(graph, values, replica=replica, strict=strict)
+
+
+def assign_weight_map(graph, values, replica=0, *, strict=True):
+    """Set one replica's weights from ``values`` (the inverse of :meth:`weight_map`).
+
+    Paths, shapes, and dtype conversions are checked before the first assignment. If an unexpected
+    framework assignment error still occurs, every variable attempted by this call is restored to
+    its original value before the error is re-raised. ``strict=False`` allows a known subset (used
+    when changing trainable parameters while preserving non-trainable weights); unknown keys are
+    always rejected.
+    """
+    slots, prepared = _prepare_weight_map(graph, values, replica=replica, strict=strict)
+    original = {
+        path: np.array(slots[path].read(replica), copy=True)
+        for path in prepared
+    }
+    attempted = []
+    try:
+        for path, value in prepared.items():
+            attempted.append(path)
+            slots[path]._assign_prepared(value, replica)
+    except Exception as err:
+        rollback_errors = []
+        for path in reversed(attempted):
+            try:
+                slots[path]._assign_prepared(original[path], replica)
+            except Exception as rollback_error:  # pragma: no cover - framework failure path
+                rollback_errors.append((path, rollback_error))
+        if rollback_errors:  # pragma: no cover - framework failure path
+            details = "; ".join(f"{path}: {failure}" for path, failure in rollback_errors)
+            raise RuntimeError(f"{err}; weight rollback also failed ({details})") from err
+        raise
 
 
 def weight_shapes(graph, replica=0):
@@ -288,7 +370,7 @@ def set_parameter_vector(graph, theta, replica=0):
         offset += size
     if offset != theta.size:
         raise ValueError(f"theta has {theta.size} entries, this graph has {offset} parameters")
-    assign_weight_map(graph, values, replica)
+    assign_weight_map(graph, values, replica, strict=False)
 
 
 # --------------------------------------------------------------------------------------
@@ -346,24 +428,43 @@ def load_weight_file(path):
                 f"{path} has no manifest ({MANIFEST_KEY!r}): not an {FORMAT_NAME!r} file"
             )
         manifest = json.loads(np.asarray(archive[MANIFEST_KEY]).item())
+        if not isinstance(manifest, dict):
+            raise ValueError(f"{path}: the weight manifest must be a JSON object")
         if manifest.get("format") != FORMAT_NAME:
             raise ValueError(
                 f"{path} declares format {manifest.get('format')!r}, expected {FORMAT_NAME!r}"
+            )
+        replicas_in_file = manifest.get("n_replicas_file")
+        if (
+            not isinstance(replicas_in_file, int)
+            or isinstance(replicas_in_file, bool)
+            or replicas_in_file != 1
+        ):
+            raise ValueError(
+                f"{path}: the weight file must describe exactly one replica, "
+                f"the manifest says {replicas_in_file!r}"
             )
         values = {}
         for key in archive.files:
             if key != MANIFEST_KEY:
                 values[key] = np.array(archive[key])
-    shapes = manifest.get("shapes") or {}
+    shapes = manifest.get("shapes")
+    if not isinstance(shapes, dict):
+        raise ValueError(f"{path}: the manifest must contain a weight-shapes mapping")
     if set(values) != set(shapes):
         raise ValueError(
             f"{path}: manifest lists {len(shapes)} weights but the file has {len(values)}"
         )
     for key, value in values.items():
-        if tuple(value.shape) != tuple(shapes[key]):
+        declared_shape = shapes[key]
+        if not isinstance(declared_shape, list) or any(
+            type(dimension) is not int or dimension < 0 for dimension in declared_shape
+        ):
+            raise ValueError(f"{path}: the manifest has an invalid shape for weight {key!r}")
+        if tuple(value.shape) != tuple(declared_shape):
             raise ValueError(
                 f"{path}: weight {key!r} has shape {tuple(value.shape)}, "
-                f"the manifest says {tuple(shapes[key])}"
+                f"the manifest says {tuple(declared_shape)}"
             )
     if not values:
         raise ValueError(f"{path}: the manifest describes no weights")

@@ -36,6 +36,16 @@ def _staged(member, phase, note=""):
     return NotImplementedError(message)
 
 
+def _graph_replica_count(graph):
+    """Count the explicit replica axis of an n3fit PDF graph (or return one for a single model)."""
+    outputs = getattr(graph, "output", None)
+    first = outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+    shape = getattr(first, "shape", None)
+    if shape is not None and len(shape) >= 4 and shape[1] is not None:
+        return int(shape[1])
+    return 1
+
+
 class KerasState:
     """Global state of the Keras backend (see :class:`n3fit.backends.base.BackendState`).
 
@@ -306,9 +316,10 @@ class KerasBackend:
         """Write the weights of one replica plus a manifest (the ``n3fit-weights/2`` schema, P5).
 
         The schema is one replica per file -- that is what the per-replica fit folders hold, what
-        ``load:`` broadcasts and what ``load_weights_from_fit`` exchanges.  ``model`` may be a
-        contract ensemble holding exactly one replica, a contract :class:`Model`, or a raw graph;
-        anything holding more than one replica is an error (save the replicas one file each).
+        ``load:`` broadcasts and what ``load_weights_from_fit`` exchanges. ``model`` may be a
+        one-replica contract ensemble, a contract :class:`Model`, or a raw graph. A raw stacked
+        graph saves replica 0 and records its actual replica count in the manifest; a multi-replica
+        ensemble is rejected so callers cannot mistake its maps for one file.
         """
         from n3fit.backends.keras_backend import weights as store
         from n3fit.backends.keras_backend.roles import KerasModelView
@@ -323,10 +334,10 @@ class KerasBackend:
             n_replicas_graph = len(model)
         elif isinstance(model, KerasModelView):
             values = store.weight_map(model._graph, replica=0)
-            n_replicas_graph = 1
+            n_replicas_graph = _graph_replica_count(model._graph)
         else:  # a raw graph
             values = store.weight_map(model, replica=0)
-            n_replicas_graph = 1
+            n_replicas_graph = _graph_replica_count(model)
         manifest = store.make_manifest(values, n_replicas_graph=n_replicas_graph, replica=0)
         store.save_weight_file(path, values, manifest=manifest)
 
@@ -343,11 +354,41 @@ class KerasBackend:
 
         values, _manifest = store.load_weight_file(path)
         if replica is None:
-            for i in range(len(ensemble)):
-                ensemble._assign_replica(values, i)
+            targets = list(range(len(ensemble)))
         else:
             if replica < 0 or replica >= len(ensemble):
                 raise ValueError(
                     f"the ensemble has {len(ensemble)} replicas, cannot load replica {replica}"
                 )
-            ensemble._assign_replica(values, replica)
+            targets = [replica]
+
+        # Validate every target before changing the first one: replicas may have different
+        # hyperopt architectures even though the weight paths are otherwise identical.
+        for index in targets:
+            ensemble._validate_replica(values, index)
+
+        # Keep snapshots as a rollback path for unexpected framework assignment failures after
+        # validation (e.g. a backend/device error).  Expected path/shape errors happen above.
+        import numpy as np
+
+        current = ensemble.weights()
+        original = {
+            index: {key: np.array(value, copy=True) for key, value in current[index].items()}
+            for index in targets
+        }
+        try:
+            for index in targets:
+                ensemble._assign_replica(values, index)
+        except Exception as err:
+            rollback_errors = []
+            for index in reversed(targets):
+                try:
+                    ensemble._assign_replica(original[index], index)
+                except Exception as rollback_error:  # pragma: no cover - framework failure path
+                    rollback_errors.append((index, rollback_error))
+            if rollback_errors:  # pragma: no cover - framework failure path
+                details = "; ".join(
+                    f"replica {index}: {failure}" for index, failure in rollback_errors
+                )
+                raise RuntimeError(f"{err}; weight rollback also failed ({details})") from err
+            raise

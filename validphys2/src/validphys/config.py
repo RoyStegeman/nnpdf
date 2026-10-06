@@ -49,6 +49,7 @@ from validphys.loader import (
 )
 from validphys.plotoptions.core import get_info
 import validphys.scalevariations
+from validphys.n3fit_weights import n3fit_weights_filename
 from validphys.utils import yaml_safe
 
 log = logging.getLogger(__name__)
@@ -174,13 +175,11 @@ class CoreConfig(configparser.Config):
             weights_name = fit_object.as_input().get("save")
             if weights_name is None:
                 raise LoadFailedError(f"{load_weights_from_fit} does not have saved weights")
-            # Correct for extension already included (the legacy h5 suffix or the current npz one)
-            for suffix in (".weights.npz", ".npz", ".weights.h5", ".h5"):
-                if weights_name.endswith(suffix):
-                    weights_name = weights_name[: -len(suffix)]
-                    break
+            # Keep this normalization identical to the writer: all runcard suffixes resolve to
+            # ``<stem>.weights.npz``. Legacy h5 payloads themselves are deliberately not read.
+            weights_name = n3fit_weights_filename(weights_name)
             weights_dict = {}
-            for p in fit_folder.glob(f"replica_*/{weights_name}.weights.npz"):
+            for p in fit_folder.glob(f"replica_*/{weights_name}"):
                 replica_folder = p.parent.name
                 replica_index = int(replica_folder.split("_")[1])
                 weights_dict[replica_index] = p
