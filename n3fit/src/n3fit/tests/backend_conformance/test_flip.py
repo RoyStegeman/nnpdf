@@ -50,6 +50,14 @@ from n3fit.tests.backend_conformance.p4_golden import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _keras_trainer(monkeypatch):
+    """This file tests the Keras trainer's own assembly (graphs *and* terms resolve through
+    the default backend), so it pins the selection: under ``N3FIT_BACKEND=jax`` the trainer
+    would hand Keras graphs to the JAX backend, which is P7 construction work, not this."""
+    monkeypatch.setenv("N3FIT_BACKEND", "keras")
+
+
 def _wrapper(name, observables, mask, dataset_xsizes, **kwargs):
     return ObservableWrapper(name, observables, mask, dataset_xsizes, **kwargs)
 

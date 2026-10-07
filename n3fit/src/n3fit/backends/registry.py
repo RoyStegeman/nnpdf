@@ -10,10 +10,12 @@ Backends are looked up, in order:
 
 1. an explicit ``name`` argument,
 2. the ``N3FIT_BACKEND`` environment variable,
-3. the ``KERAS_BACKEND`` environment variable, *but only if it names a registered backend*.
-   ``KERAS_BACKEND`` historically selects the framework (``tensorflow``/``torch``/``jax``)
-   for Keras itself, so ``KERAS_BACKEND=jax`` must keep meaning "the keras backend, running
-   on jax" rather than "a backend called jax" -- Keras reads that variable by itself,
+3. the ``KERAS_BACKEND`` environment variable, *but only when it says ``"keras"``*.
+   ``KERAS_BACKEND`` belongs to Keras: it selects the framework (``tensorflow``/``torch``/
+   ``jax``) Keras itself runs on, so ``KERAS_BACKEND=jax`` must keep meaning "the keras
+   backend, running on jax" -- in particular now that a backend *called* ``jax`` exists
+   (P6).  Narrowing this rule to ``"keras"`` is what keeps that selection from silently
+   switching backends; anything else falls through to the default,
 4. the default, ``"keras"``.
 
 Third parties can add a backend with :func:`register_backend`; the mapping from name to
@@ -43,6 +45,7 @@ DEFAULT_BACKEND = "keras"
 # name -> "module.path:ClassName".  Deliberately data, not imports: see the module docstring.
 _BUILTIN_BACKENDS = {
     "keras": "n3fit.backends.keras_backend.backend:KerasBackend",
+    "jax": "n3fit.backends.jax_backend.backend:JaxBackend",
 }
 
 _registry = dict(_BUILTIN_BACKENDS)
@@ -107,10 +110,11 @@ def _resolve_name(name):
         return name
     if value := os.environ.get("N3FIT_BACKEND"):
         return value.lower()
-    if (value := os.environ.get("KERAS_BACKEND")) and (candidate := value.lower()) in _registry:
-        # See point 3 of the module docstring: this variable belongs to Keras, and we only
-        # interpret it when it happens to name one of our backends.
-        return candidate
+    if (value := os.environ.get("KERAS_BACKEND")) and value.lower() == DEFAULT_BACKEND:
+        # See point 3 of the module docstring: this variable belongs to Keras, and the only
+        # value that may select an n3fit backend through it is "keras" itself.  Anything else
+        # (in particular "jax", now that it names a backend) falls through to the default.
+        return DEFAULT_BACKEND
     return DEFAULT_BACKEND
 
 

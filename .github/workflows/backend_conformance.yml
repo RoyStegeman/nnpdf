@@ -1,0 +1,76 @@
+# P6: the backend gates -- conformance per backend, the import ban, the lint gate.
+#
+# Lightweight by design: no conda stack, no theory folders, no commondata, no runcard.
+# It fails if a backend regresses, if a framework import leaks out of
+# ``backends/*_backend/``, or if the two engines drift apart. The regression-fit gates
+# stay in the heavy workflow.
+#
+# Matrix: three selection modes x two interpreters.
+#   framework-free:  no keras/jax installed -- the offline half of the suite must pass
+#                    and the framework-bound half must skip (not error).
+#   keras-on-jax:    KERAS_BACKEND=jax -- the full gate, Keras running on the jax
+#                    framework plus the raw jax backend via the parametrized fixture.
+#   jax-selected:    N3FIT_BACKEND=jax (on top of KERAS_BACKEND=jax, which Keras itself
+#                    needs to import) -- the full gate with the raw backend as default.
+name: backend conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+        mode: [framework-free, keras-on-jax, jax-selected]
+        include:
+          - mode: framework-free
+            keras_backend: ""
+            n3fit_backend: ""
+          - mode: keras-on-jax
+            keras_backend: "jax"
+            n3fit_backend: ""
+          - mode: jax-selected
+            keras_backend: "jax"
+            n3fit_backend: "jax"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: install the gate's dependencies (no frameworks)
+        run: >
+          pip install numpy scipy pandas pyyaml pytest requests reportengine validobj
+          lhapdf_management ruff
+
+      - name: install the frameworks (skipped when framework-free)
+        if: matrix.mode != 'framework-free'
+        # eko/pineappl/yadism: validphys physics deps the trainer-assembly tests
+        # (test_flip, test_weight_store) import through n3fit.model_gen.
+        run: pip install keras jax optax eko pineappl yadism
+
+      - name: backend conformance + import ban + facade
+        env:
+          PYTHONPATH: n3fit/src:validphys2/src:nnpdf_data
+          KERAS_BACKEND: ${{ matrix.keras_backend }}
+          N3FIT_BACKEND: ${{ matrix.n3fit_backend }}
+        run: >
+          python -m pytest
+          n3fit/src/n3fit/tests/backend_conformance
+          n3fit/src/n3fit/tests/test_backend_imports.py
+          n3fit/src/n3fit/tests/test_backends_facade.py
+          --confcutdir=n3fit/src/n3fit/tests/backend_conformance
+          -q -p no:cacheprovider
+
+      - name: lint gate (undefined names in the backend surface)
+        run: >
+          ruff check --select F821
+          n3fit/src/n3fit/backends/
+          n3fit/src/n3fit/tests/backend_conformance/
+          n3fit/src/n3fit/tests/test_backend_imports.py
+          n3fit/src/n3fit/tests/test_backends_facade.py

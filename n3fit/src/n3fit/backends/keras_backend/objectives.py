@@ -141,6 +141,10 @@ class KerasObjective:
         self.spec = spec
         self._layer = layer
         self._schema = OBJECTIVE_SCHEMAS[spec.kind]
+        # Bumped by every ``set_data``/``set_scalar``: the engine's compiled train step
+        # captures the term layer's weights by value under ``jit`` (``KERAS_BACKEND=jax``),
+        # so a mid-run change must recompile or training silently keeps the old value.
+        self._generation = 0
 
     # ------------------------------------------------------------------ validation
     @staticmethod
@@ -232,6 +236,7 @@ class KerasObjective:
         inverse = np.linalg.inv(covmat)
         ensure_built(self._layer)
         self._layer.kernel.assign(inverse)
+        self._generation += 1
         # keep the spec honest: n3fit reads spec.data["covmat"] to build the sum it passes
         self.spec.data["covmat"] = covmat
 
@@ -239,6 +244,7 @@ class KerasObjective:
         """The legacy ``update_mask``."""
         ensure_built(self._layer)
         self._layer.mask.assign(mask)
+        self._generation += 1
 
     # ------------------------------------------------------------------ scalars
     def set_scalar(self, name, value):
@@ -257,6 +263,7 @@ class KerasObjective:
         if name == "multiplier":
             ensure_built(self._layer)
             self._layer.kernel.assign(np.asarray([value], dtype=np.float32))
+            self._generation += 1
             self.spec.options["multiplier"] = value
         else:  # pragma: no cover - the schema above has a single scalar; guards future kinds
             raise NotImplementedError(f"set_scalar({name!r}) is not implemented for this kind")

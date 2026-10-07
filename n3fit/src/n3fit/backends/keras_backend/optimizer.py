@@ -199,10 +199,14 @@ class KerasOptimizer:
         graph = self._graph(ensemble, GROUP_TRAINING)
         self._groups = dict(groups)
         training_names = tuple(groups[GROUP_TRAINING])
+        # The optimizer instance is kept: a mid-run recompile (below) must reuse it, or the
+        # accumulator state (Adam's moments, the iteration count) would silently reset.
+        optimizer = self._make_optimizer(self.spec.name)
         graph.compile(
-            optimizer=self._make_optimizer(self.spec.name),
+            optimizer=optimizer,
             loss=self._loss_for(terms, training_names),
         )
+        generations = _generations(terms, training_names)
         inputs = self._inputs(graph)
         targets = self._targets(graph)
 
@@ -225,6 +229,20 @@ class KerasOptimizer:
         step = 0
         monitor_every = int(monitor_every) if monitor_every else None
         while step < steps:
+            # Term state captured in the compiled train step is fixed for a run *unless* a
+            # hook moved it (the Lagrange schedule moves the multiplier every period): the
+            # jitted step closes over the term layers' weights *by value*, so without a
+            # recompile training would silently keep the old value while ``scalar()`` and
+            # the eager evaluations report the new one.  Recompiling with the same
+            # optimizer instance keeps the accumulator state; the loss closures are rebuilt
+            # over the same terms, so only the captured values change.
+            current = _generations(terms, training_names)
+            if current != generations:
+                graph.compile(
+                    optimizer=optimizer,
+                    loss=self._loss_for(terms, training_names),
+                )
+                generations = current
             chunk = min(monitor_every or steps - step, steps - step)
             logs = None
             for offset in range(chunk):
@@ -319,6 +337,14 @@ def _output_of(term):
     """The graph output a term consumes: its own name unless it declares another prediction."""
     prediction = getattr(term.spec, "prediction", None)
     return prediction or term.spec.name
+
+
+def _generations(terms, names):
+    """The state generations of the named terms (see :meth:`KerasOptimizer.run`)."""
+    return {
+        name: terms[name]._generation  # pylint: disable=protected-access  (same backend)
+        for name in names
+    }
 
 
 def _step_budget(steps, monitor_every):

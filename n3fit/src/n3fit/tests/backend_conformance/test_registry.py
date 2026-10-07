@@ -78,9 +78,38 @@ def test_n3fit_backend_env_var_always_wins(monkeypatch):
 
 
 def test_n3fit_backend_env_var_with_unknown_name_fails(monkeypatch):
-    monkeypatch.setenv("N3FIT_BACKEND", "jax")
+    # NOTE: this used to set N3FIT_BACKEND=jax, back when "jax" named no backend; since P6
+    # it does, so the unknown name is spelled out instead.
+    monkeypatch.setenv("N3FIT_BACKEND", "definitely_not_a_backend")
     with pytest.raises(ValueError):
         get_backend()
+
+
+def test_keras_backend_jax_still_selects_keras_now_that_jax_exists(monkeypatch):
+    """``KERAS_BACKEND`` belongs to Keras, even though ``jax`` now names an n3fit backend.
+
+    P6 registers the raw JAX backend under ``"jax"`` and narrows the selection rule in the
+    same patch: ``KERAS_BACKEND`` is only honored when it says ``"keras"``.  Without the
+    narrowing, every ``KERAS_BACKEND=jax`` environment (the project's own strong recipe
+    included) would silently stop using the Keras backend.
+    """
+    from n3fit.backends import available_backends
+
+    assert "jax" in available_backends()
+    monkeypatch.delenv("N3FIT_BACKEND", raising=False)
+    monkeypatch.setenv("KERAS_BACKEND", "jax")
+    assert selected_backend_name() == "keras"
+
+
+def test_n3fit_backend_jax_selects_the_raw_backend(monkeypatch):
+    """The opt-in spelling for the P6 backend (skipped where jax is not installed)."""
+    jax = pytest.importorskip("jax")
+    pytest.importorskip("optax")
+    assert jax is not None
+    monkeypatch.setenv("N3FIT_BACKEND", "jax")
+    monkeypatch.delenv("KERAS_BACKEND", raising=False)
+    assert selected_backend_name() == "jax"
+    assert get_backend().name == "jax"
 
 
 def test_importing_the_backend_package_needs_no_framework():
